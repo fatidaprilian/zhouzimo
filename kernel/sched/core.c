@@ -1547,6 +1547,68 @@ static void __init init_uclamp(void)
 	}
 }
 
+void sched_uclamp_enable(void)
+{
+	static_branch_enable(&sched_uclamp_used);
+}
+
+unsigned int sched_get_uclamp_min(struct task_struct *p)
+{
+	unsigned int val;
+
+	rcu_read_lock();
+	val = (unsigned int)uclamp_eff_value(p, UCLAMP_MIN);
+	rcu_read_unlock();
+
+	return val;
+}
+
+void sched_get_uclamp_min_req(struct task_struct *p, unsigned int *val,
+			      bool *user_defined)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+
+	rq = task_rq_lock(p, &rf);
+	*val = p->uclamp_req[UCLAMP_MIN].value;
+	*user_defined = p->uclamp_req[UCLAMP_MIN].user_defined;
+	task_rq_unlock(rq, p, &rf);
+}
+
+/*
+ * Spinlock-safe uclamp.min update for kernel callers that must run inside
+ * atomic context (static key must already be enabled in sleepable context).
+ */
+void sched_set_uclamp_min_nocheck(struct task_struct *p, unsigned int util_min,
+				  bool user_defined)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+
+	rq = task_rq_lock(p, &rf);
+	if (unlikely(p == rq->stop))
+		goto unlock;
+
+	if (!user_defined)
+		util_min = unlikely(rt_task(p)) ?
+			   sysctl_sched_uclamp_util_min_rt_default :
+			   uclamp_none(UCLAMP_MIN);
+	else
+		util_min = min_t(unsigned int, util_min, SCHED_CAPACITY_SCALE);
+
+	if (p->uclamp_req[UCLAMP_MIN].value == util_min &&
+	    p->uclamp_req[UCLAMP_MIN].user_defined == user_defined)
+		goto unlock;
+
+	uclamp_se_set(&p->uclamp_req[UCLAMP_MIN], util_min, user_defined);
+
+	if (static_branch_likely(&sched_uclamp_used))
+		uclamp_rq_reinc_id(rq, p, UCLAMP_MIN);
+
+unlock:
+	task_rq_unlock(rq, p, &rf);
+}
+
 #else /* CONFIG_UCLAMP_TASK */
 static inline void uclamp_rq_inc(struct rq *rq, struct task_struct *p, int flags) { }
 static inline void uclamp_rq_dec(struct rq *rq, struct task_struct *p) { }

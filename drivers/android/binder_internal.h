@@ -348,9 +348,11 @@ struct binder_ref {
 	struct binder_ref_freeze *freeze;
 };
 /**
- * struct binder_priority - scheduler policy and priority
+ * struct binder_priority - scheduler policy, priority, and uclamp min
  * @sched_policy            scheduler policy
  * @prio                    [100..139] for SCHED_NORMAL, [0..99] for FIFO/RT
+ * @util_min                minimum utilization clamp value
+ * @util_min_user_defined   whether @util_min is explicitly inherited/user-set
  *
  * The binder driver supports inheriting the following scheduler policies:
  * SCHED_NORMAL
@@ -361,6 +363,8 @@ struct binder_ref {
 struct binder_priority {
 	unsigned int sched_policy;
 	int prio;
+	unsigned int util_min;
+	bool util_min_user_defined;
 };
 
 enum binder_prio_state {

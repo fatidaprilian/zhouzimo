@@ -1773,6 +1773,31 @@ extern void sched_set_fifo_low(struct task_struct *p);
 extern void sched_set_normal(struct task_struct *p, int nice);
 extern int sched_setattr(struct task_struct *, const struct sched_attr *);
 extern int sched_setattr_nocheck(struct task_struct *, const struct sched_attr *);
+#ifdef CONFIG_UCLAMP_TASK
+extern void sched_uclamp_enable(void);
+extern unsigned int sched_get_uclamp_min(struct task_struct *p);
+extern void sched_get_uclamp_min_req(struct task_struct *p, unsigned int *val,
+				     bool *user_defined);
+extern void sched_set_uclamp_min_nocheck(struct task_struct *p,
+					 unsigned int util_min,
+					 bool user_defined);
+#else
+static inline void sched_uclamp_enable(void) { }
+static inline unsigned int sched_get_uclamp_min(struct task_struct *p)
+{
+	return 0;
+}
+static inline void sched_get_uclamp_min_req(struct task_struct *p,
+					    unsigned int *val,
+					    bool *user_defined)
+{
+	*val = 0;
+	*user_defined = false;
+}
+static inline void sched_set_uclamp_min_nocheck(struct task_struct *p,
+						unsigned int util_min,
+						bool user_defined) { }
+#endif
 extern struct task_struct *idle_task(int cpu);
 
 /**
