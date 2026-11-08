@@ -448,7 +448,7 @@ static int vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
 			struct vm_area_struct *prev)
 {
 	struct address_space *mapping = NULL;
-	MA_STATE(mas, &mm->mm_mt, 0, 0);
+	MA_STATE(mas, &mm->mm_mt, vma->vm_start, vma->vm_end - 1);
 
 	if (mas_preallocate(&mas, vma, GFP_KERNEL))
 		return -ENOMEM;
@@ -672,18 +672,25 @@ again:
 	 * ENOMEM nothing has been mutated yet, so the caller can
 	 * unwind cleanly (this mirrors the vma_link() ordering).
 	 */
+	mas_set_range(&mas, start, end - 1);
 	if (mas_preallocate(&mas, vma, GFP_KERNEL))
 		return -ENOMEM;
-	if (insert && mas_preallocate(&mas_insert, insert, GFP_KERNEL)) {
-		mas_destroy(&mas);
-		return -ENOMEM;
+	if (insert) {
+		mas_set_range(&mas_insert, insert->vm_start,
+			      insert->vm_end - 1);
+		if (mas_preallocate(&mas_insert, insert, GFP_KERNEL)) {
+			mas_destroy(&mas);
+			return -ENOMEM;
+		}
 	}
-	if (adjust_next && !remove_next &&
-	    mas_preallocate(&mas_next, next, GFP_KERNEL)) {
-		mas_destroy(&mas);
-		if (insert)
-			mas_destroy(&mas_insert);
-		return -ENOMEM;
+	if (adjust_next && !remove_next) {
+		mas_set_range(&mas_next, next->vm_start, next->vm_end - 1);
+		if (mas_preallocate(&mas_next, next, GFP_KERNEL)) {
+			mas_destroy(&mas);
+			if (insert)
+				mas_destroy(&mas_insert);
+			return -ENOMEM;
+		}
 	}
 
 	if (root) {
@@ -2071,6 +2078,7 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
 				 * is safe here; this path already sleeps in
 				 * acct_stack_growth()).
 				 */
+				mas_set_range(&mas, vma->vm_start, address - 1);
 				if (mas_preallocate(&mas, vma, GFP_KERNEL))
 					error = -ENOMEM;
 			}
@@ -2161,6 +2169,7 @@ int expand_downwards(struct vm_area_struct *vma,
 				 * is safe here; this path already sleeps in
 				 * acct_stack_growth()).
 				 */
+				mas_set_range(&mas, address, vma->vm_end - 1);
 				if (mas_preallocate(&mas, vma, GFP_KERNEL))
 					error = -ENOMEM;
 			}
