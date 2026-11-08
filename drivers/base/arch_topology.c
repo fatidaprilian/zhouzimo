@@ -337,10 +337,22 @@ void topology_normalize_cpu_scale(void)
 
 	pr_debug("cpu_capacity: capacity_scale=%llu\n", capacity_scale);
 	for_each_possible_cpu(cpu) {
+		unsigned long old_scale = per_cpu(cpu_scale, cpu);
+
 		capacity = raw_capacity[cpu] * per_cpu(freq_factor, cpu);
 		capacity = div64_u64(capacity << SCHED_CAPACITY_SHIFT,
 			capacity_scale);
 		topology_set_cpu_scale(cpu, capacity);
+		/*
+		 * cpufreq initializes policies sequentially and calls
+		 * arch_set_min_freq_scale() before the final policy triggers
+		 * topology_normalize_cpu_scale(). Rescale arch_min_freq_scale
+		 * to match the normalized cpu_scale.
+		 */
+		if (old_scale && per_cpu(arch_min_freq_scale, cpu))
+			per_cpu(arch_min_freq_scale, cpu) =
+				(per_cpu(arch_min_freq_scale, cpu) * capacity) /
+				old_scale;
 		pr_debug("cpu_capacity: CPU%d cpu_capacity=%lu\n",
 			cpu, topology_get_cpu_scale(cpu));
 	}
