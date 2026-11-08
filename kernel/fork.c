@@ -986,13 +986,14 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 {
 	mm->mmap = NULL;
 	mm->mm_rb = RB_ROOT; /* KABI dummy - keep empty, do not use */
-#ifdef CONFIG_MAPLE_TREE
-	mt_init(&mm->mm_mt);
-#endif
 	mm->vmacache_seqnum = 0;
 	atomic_set(&mm->mm_users, 1);
 	atomic_set(&mm->mm_count, 1);
 	init_rwsem(&mm->mmap_sem);
+#ifdef CONFIG_MAPLE_TREE
+	mt_init_flags(&mm->mm_mt, MM_MT_FLAGS);
+	mt_set_external_lock(&mm->mm_mt, &mm->mmap_sem);
+#endif
 	INIT_LIST_HEAD(&mm->mmlist);
 	mm->core_state = NULL;
 	mm_pgtables_bytes_init(mm);
