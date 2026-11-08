@@ -45,16 +45,6 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 	struct cfs_rq *cfs_rq = &rq->cfs;
 	unsigned long est;
 
-	/*
-	 * Idle CPUs have no active CFS tasks; any residual cfs_rq util_avg
-	 * or util_est is decaying historical load that would otherwise make
-	 * an idle CPU appear busier than an active uclamp-clamped CPU.
-	 */
-	if (c->exit_lat) {
-		c->util = 0;
-		goto skip_cfs_util;
-	}
-
 	/* Get this CPU's utilization from CFS tasks */
 	c->util = READ_ONCE(cfs_rq->avg.util_avg);
 	if (sched_feat(UTIL_EST)) {
@@ -73,7 +63,6 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 	if (sync && c->cpu == this_cpu && !rt_task(current))
 		c->util -= min(c->util, task_util(current));
 
-skip_cfs_util:
 	/* Get the utilization of everything other than CFS tasks */
 	c->hard_util = cpu_util_rt(rq) + cpu_util_dl(rq) + cpu_util_irq(rq);
 
@@ -136,16 +125,19 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 		goto done;
 
 	/*
-	 * Burst-wake protection: PELT utilization lags behind reality during
-	 * burst wakes. Penalize deeper runqueues immediately for latency-sensitive
-	 * tasks (gap >= 1) while allowing minor packing for normal tasks (gap >= 2).
+	 * Burst-wake protection within the same capacity cluster: PELT
+	 * utilization lags behind reality during burst wakes. Scoping this
+	 * to equal-capacity CPUs prevents an idle little core from overriding
+	 * uclamp-based big cluster selection before relative util is compared.
 	 */
-	if (a->nr_running >= b->nr_running + nr_gap) {
-		res = -1;
-		goto done;
-	} else if (b->nr_running >= a->nr_running + nr_gap) {
-		res = 1;
-		goto done;
+	if (a->cap_orig == b->cap_orig) {
+		if (a->nr_running >= b->nr_running + nr_gap) {
+			res = -1;
+			goto done;
+		} else if (b->nr_running >= a->nr_running + nr_gap) {
+			res = 1;
+			goto done;
+		}
 	}
 
 	/* Prefer the CPU with lower relative utilization */
