@@ -504,14 +504,33 @@ enum zone_watermarks {
 #define high_wmark_pages(z) (z->_watermark[WMARK_HIGH] + z->watermark_boost)
 #define wmark_pages(z, i) (z->_watermark[i] + z->watermark_boost)
 
+#define NR_PCP_ORDER (PAGE_ALLOC_COSTLY_ORDER + 1)
+#define NR_PCP_LISTS (NR_PCP_ORDER * MIGRATE_PCPTYPES)
+
 struct per_cpu_pages {
 	int count;		/* number of pages in the list */
 	int high;		/* high watermark, emptying needed */
 	int batch;		/* chunk size for buddy add/remove */
 
-	/* Lists of pages, one per migrate type stored on the pcp-lists */
-	struct list_head lists[MIGRATE_PCPTYPES];
+	/* Lists of pages, one per migrate type and order on the pcp-lists */
+	struct list_head lists[NR_PCP_LISTS];
 };
+
+static inline unsigned int order_to_pindex(int migratetype, unsigned int order)
+{
+	return (order * MIGRATE_PCPTYPES) + migratetype;
+}
+
+static inline unsigned int pindex_to_order(unsigned int pindex)
+{
+	return pindex / MIGRATE_PCPTYPES;
+}
+
+static inline struct list_head *
+pcp_list(struct per_cpu_pages *pcp, unsigned int order, int migratetype)
+{
+	return &pcp->lists[order_to_pindex(migratetype, order)];
+}
 
 struct per_cpu_pageset {
 	struct per_cpu_pages pcp;
