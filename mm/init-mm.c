@@ -26,11 +26,7 @@
  * and size this cpu_bitmask to NR_CPUS.
  */
 struct mm_struct init_mm = {
-	.mm_rb		= RB_ROOT, /* KABI dummy - keep empty, do not use */
-#ifdef CONFIG_MAPLE_TREE
-	.mm_mt		= MTREE_INIT_EXT(init_mm.mm_mt, MM_MT_FLAGS,
-					 init_mm.mmap_sem),
-#endif
+	.mm_rb		= RB_ROOT,
 	.pgd		= swapper_pg_dir,
 	.mm_users	= ATOMIC_INIT(2),
 	.mm_count	= ATOMIC_INIT(1),

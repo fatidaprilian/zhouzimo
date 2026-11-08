@@ -844,7 +844,7 @@ struct task_struct {
 	struct mm_struct		*mm;
 	struct mm_struct		*active_mm;
 
-	/* KABI dummy padding - do not use. */
+	/* Per-thread vma caching: */
 	struct vmacache			vmacache;
 
 #ifdef SPLIT_RSS_COUNTING

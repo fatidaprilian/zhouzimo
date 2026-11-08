@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include <linux/backing-dev.h>
 #include <linux/mm.h>
+#include <linux/vmacache.h>
 #include <linux/shm.h>
 #include <linux/mman.h>
 #include <linux/pagemap.h>
@@ -45,10 +46,6 @@
 #include <linux/pkeys.h>
 #include <linux/oom.h>
 #include <linux/sched/mm.h>
-
-/* 4.19 backport: tracepoints used by the maple helpers are no-ops
- * (see include/trace/events/maple_tree.h). */
-#include <trace/events/maple_tree.h>
 
 #include <linux/uaccess.h>
 #include <asm/cacheflush.h>
@@ -261,15 +258,115 @@ out:
 	return retval;
 }
 
+static inline unsigned long vma_compute_gap(struct vm_area_struct *vma)
+{
+	unsigned long gap, prev_end;
+
+	/*
+	 * Note: in the rare case of a VM_GROWSDOWN above a VM_GROWSUP, we
+	 * allow two stack_guard_gaps between them here, and when choosing
+	 * an unmapped area; whereas when expanding we only require one.
+	 * That's a little inconsistent, but keeps the code here simpler.
+	 */
+	gap = vm_start_gap(vma);
+	if (vma->vm_prev) {
+		prev_end = vm_end_gap(vma->vm_prev);
+		if (gap > prev_end)
+			gap -= prev_end;
+		else
+			gap = 0;
+	}
+	return gap;
+}
+
 #ifdef CONFIG_DEBUG_VM_RB
+static unsigned long vma_compute_subtree_gap(struct vm_area_struct *vma)
+{
+	unsigned long max = vma_compute_gap(vma), subtree_gap;
+	if (vma->vm_rb.rb_left) {
+		subtree_gap = rb_entry(vma->vm_rb.rb_left,
+				struct vm_area_struct, vm_rb)->rb_subtree_gap;
+		if (subtree_gap > max)
+			max = subtree_gap;
+	}
+	if (vma->vm_rb.rb_right) {
+		subtree_gap = rb_entry(vma->vm_rb.rb_right,
+				struct vm_area_struct, vm_rb)->rb_subtree_gap;
+		if (subtree_gap > max)
+			max = subtree_gap;
+	}
+	return max;
+}
+
+static int browse_rb(struct mm_struct *mm)
+{
+	struct rb_root *root = &mm->mm_rb;
+	int i = 0, j, bug = 0;
+	struct rb_node *nd, *pn = NULL;
+	unsigned long prev = 0, pend = 0;
+
+	for (nd = rb_first(root); nd; nd = rb_next(nd)) {
+		struct vm_area_struct *vma;
+		vma = rb_entry(nd, struct vm_area_struct, vm_rb);
+		if (vma->vm_start < prev) {
+			pr_emerg("vm_start %lx < prev %lx\n",
+				  vma->vm_start, prev);
+			bug = 1;
+		}
+		if (vma->vm_start < pend) {
+			pr_emerg("vm_start %lx < pend %lx\n",
+				  vma->vm_start, pend);
+			bug = 1;
+		}
+		if (vma->vm_start > vma->vm_end) {
+			pr_emerg("vm_start %lx > vm_end %lx\n",
+				  vma->vm_start, vma->vm_end);
+			bug = 1;
+		}
+		spin_lock(&mm->page_table_lock);
+		if (vma->rb_subtree_gap != vma_compute_subtree_gap(vma)) {
+			pr_emerg("free gap %lx, correct %lx\n",
+			       vma->rb_subtree_gap,
+			       vma_compute_subtree_gap(vma));
+			bug = 1;
+		}
+		spin_unlock(&mm->page_table_lock);
+		i++;
+		pn = nd;
+		prev = vma->vm_start;
+		pend = vma->vm_end;
+	}
+	j = 0;
+	for (nd = pn; nd; nd = rb_prev(nd))
+		j++;
+	if (i != j) {
+		pr_emerg("backwards %d, forwards %d\n", j, i);
+		bug = 1;
+	}
+	return bug ? -1 : i;
+}
+
+static void validate_mm_rb(struct rb_root *root, struct vm_area_struct *ignore)
+{
+	struct rb_node *nd;
+
+	for (nd = rb_first(root); nd; nd = rb_next(nd)) {
+		struct vm_area_struct *vma;
+		vma = rb_entry(nd, struct vm_area_struct, vm_rb);
+		VM_BUG_ON_VMA(vma != ignore &&
+			vma->rb_subtree_gap != vma_compute_subtree_gap(vma),
+			vma);
+	}
+}
+
 static void validate_mm(struct mm_struct *mm)
 {
 	int bug = 0;
 	int i = 0;
-	struct vm_area_struct *vma;
-	MA_STATE(mas, &mm->mm_mt, 0, 0);
+	unsigned long highest_address = 0;
+	struct vm_area_struct *vma = mm->mmap;
 
-	mas_for_each(&mas, vma, ULONG_MAX) {
+	while (vma) {
 		struct anon_vma *anon_vma = vma->anon_vma;
 		struct anon_vma_chain *avc;
 
@@ -280,27 +377,94 @@ static void validate_mm(struct mm_struct *mm)
 			anon_vma_unlock_read(anon_vma);
 		}
 
+		highest_address = vm_end_gap(vma);
+		vma = vma->vm_next;
 		i++;
 	}
 	if (i != mm->map_count) {
-		pr_emerg("map_count %d maple %d\n", mm->map_count, i);
+		pr_emerg("map_count %d vm_next %d\n", mm->map_count, i);
+		bug = 1;
+	}
+	if (highest_address != mm->highest_vm_end) {
+		pr_emerg("mm->highest_vm_end %lx, found %lx\n",
+			  mm->highest_vm_end, highest_address);
+		bug = 1;
+	}
+	i = browse_rb(mm);
+	if (i != mm->map_count) {
+		if (i != -1)
+			pr_emerg("map_count %d rb %d\n", mm->map_count, i);
 		bug = 1;
 	}
 	VM_BUG_ON_MM(bug, mm);
 }
 #else
+#define validate_mm_rb(root, ignore) do { } while (0)
 #define validate_mm(mm) do { } while (0)
 #endif
 
-struct vm_area_struct *find_vma_prev(struct mm_struct *mm,
-				 unsigned long addr,
-				 struct vm_area_struct **pprev);
-struct vm_area_struct *find_vma_intersection(struct mm_struct *mm,
-					    unsigned long start,
-					    unsigned long end);
+RB_DECLARE_CALLBACKS_MAX(static, vma_gap_callbacks,
+			 struct vm_area_struct, vm_rb,
+			 unsigned long, rb_subtree_gap, vma_compute_gap)
 
-/* rbtree helpers removed: the maple tree is now authoritative. */
+/*
+ * Update augmented rbtree rb_subtree_gap values after vma->vm_start or
+ * vma->vm_prev->vm_end values changed, without modifying the vma's position
+ * in the rbtree.
+ */
+static void vma_gap_update(struct vm_area_struct *vma)
+{
+	/*
+	 * As it turns out, RB_DECLARE_CALLBACKS_MAX() already created
+	 * a callback function that does exactly what we want.
+	 */
+	vma_gap_callbacks_propagate(&vma->vm_rb, NULL);
+}
 
+static inline void vma_rb_insert(struct vm_area_struct *vma,
+				 struct rb_root *root)
+{
+	/* All rb_subtree_gap values must be consistent prior to insertion */
+	validate_mm_rb(root, NULL);
+
+	rb_insert_augmented(&vma->vm_rb, root, &vma_gap_callbacks);
+}
+
+static void __vma_rb_erase(struct vm_area_struct *vma, struct rb_root *root)
+{
+	/*
+	 * Note rb_erase_augmented is a fairly large inline function,
+	 * so make sure we instantiate it only once with our desired
+	 * augmented rbtree callbacks.
+	 */
+	rb_erase_augmented(&vma->vm_rb, root, &vma_gap_callbacks);
+}
+
+static __always_inline void vma_rb_erase_ignore(struct vm_area_struct *vma,
+						struct rb_root *root,
+						struct vm_area_struct *ignore)
+{
+	/*
+	 * All rb_subtree_gap values must be consistent prior to erase,
+	 * with the possible exception of the "next" vma being erased if
+	 * next->vm_start was reduced.
+	 */
+	validate_mm_rb(root, ignore);
+
+	__vma_rb_erase(vma, root);
+}
+
+static __always_inline void vma_rb_erase(struct vm_area_struct *vma,
+					 struct rb_root *root)
+{
+	/*
+	 * All rb_subtree_gap values must be consistent prior to erase,
+	 * with the possible exception of the vma being erased.
+	 */
+	validate_mm_rb(root, vma);
+
+	__vma_rb_erase(vma, root);
+}
 
 /*
  * vma has some anon_vma assigned, and is already inserted on that
@@ -334,9 +498,39 @@ anon_vma_interval_tree_post_update_vma(struct vm_area_struct *vma)
 		anon_vma_interval_tree_insert(avc, &avc->anon_vma->rb_root);
 }
 
-/* find_vma_links() removed: callers use find_vma_prev() +
- * find_vma_intersection() on mm->mm_mt. */
+static int find_vma_links(struct mm_struct *mm, unsigned long addr,
+		unsigned long end, struct vm_area_struct **pprev,
+		struct rb_node ***rb_link, struct rb_node **rb_parent)
+{
+	struct rb_node **__rb_link, *__rb_parent, *rb_prev;
 
+	__rb_link = &mm->mm_rb.rb_node;
+	rb_prev = __rb_parent = NULL;
+
+	while (*__rb_link) {
+		struct vm_area_struct *vma_tmp;
+
+		__rb_parent = *__rb_link;
+		vma_tmp = rb_entry(__rb_parent, struct vm_area_struct, vm_rb);
+
+		if (vma_tmp->vm_end > addr) {
+			/* Fail if an existing vma overlaps the area */
+			if (vma_tmp->vm_start < end)
+				return -ENOMEM;
+			__rb_link = &__rb_parent->rb_left;
+		} else {
+			rb_prev = __rb_parent;
+			__rb_link = &__rb_parent->rb_right;
+		}
+	}
+
+	*pprev = NULL;
+	if (rb_prev)
+		*pprev = rb_entry(rb_prev, struct vm_area_struct, vm_rb);
+	*rb_link = __rb_link;
+	*rb_parent = __rb_parent;
+	return 0;
+}
 
 static unsigned long count_vma_pages_range(struct mm_struct *mm,
 		unsigned long addr, unsigned long end)
@@ -366,57 +560,29 @@ static unsigned long count_vma_pages_range(struct mm_struct *mm,
 	return nr_pages;
 }
 
-/*
- * vma_mas_store() - Store a VMA in the maple tree.
- * @vma: The vm_area_struct
- * @mas: The maple state
- *
- * Efficient way to store a VMA in the maple tree when the @mas has already
- * walked to the correct location.
- * Note: the end address is inclusive in the maple tree.
- */
-void vma_mas_store(struct vm_area_struct *vma, struct ma_state *mas)
+void __vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
+		struct rb_node **rb_link, struct rb_node *rb_parent)
 {
-	trace_vma_store(mas->tree, vma);
-	mas_set_range(mas, vma->vm_start, vma->vm_end - 1);
-	mas_store_prealloc(mas, vma);
+	/* Update tracking information for the gap following the new vma. */
+	if (vma->vm_next)
+		vma_gap_update(vma->vm_next);
+	else
+		mm->highest_vm_end = vm_end_gap(vma);
+
+	/*
+	 * vma->vm_prev wasn't known when we followed the rbtree to find the
+	 * correct insertion point for that vma. As a result, we could not
+	 * update the vma vm_rb parents rb_subtree_gap values on the way down.
+	 * So, we first insert the vma with a zero rb_subtree_gap value
+	 * (to be consistent with what we did on the way down), and then
+	 * immediately update the gap to the correct value. Finally we
+	 * rebalance the rbtree after all augmented values have been set.
+	 */
+	rb_link_node(&vma->vm_rb, rb_parent, rb_link);
+	vma->rb_subtree_gap = 0;
+	vma_gap_update(vma);
+	vma_rb_insert(vma, &mm->mm_rb);
 }
-
-/*
- * vma_mas_remove() - Remove a VMA from the maple tree.
- * @vma: The vm_area_struct
- * @mas: The maple tree ma_state
- *
- * Efficient way to remove a VMA from the maple tree when the @mas has already
- * established and points to the correct location.
- * Note: the end address is inclusive in the maple tree.
- */
-void vma_mas_remove(struct vm_area_struct *vma, struct ma_state *mas)
-{
-	trace_vma_mas_szero(mas->tree, vma->vm_start, vma->vm_end - 1);
-	mas->index = vma->vm_start;
-	mas->last = vma->vm_end - 1;
-	mas_store_prealloc(mas, NULL);
-}
-
-/*
- * vma_mas_szero() - Set a given range to zero.  Used when modifying a
- * vm_area_struct start or end.
- *
- * @mas: The maple tree ma_state
- * @start: The start address to zero
- * @end: The end address to zero.
- */
-static inline void vma_mas_szero(struct ma_state *mas, unsigned long start,
-				 unsigned long end)
-{
-	trace_vma_mas_szero(mas->tree, start, end - 1);
-	mas_set_range(mas, start, end - 1);
-	mas_store_prealloc(mas, NULL);
-}
-
-/* __vma_link_rb() removed with the rbtree write path. */
-
 
 static void __vma_link_file(struct vm_area_struct *vma)
 {
@@ -439,27 +605,25 @@ static void __vma_link_file(struct vm_area_struct *vma)
 
 static void
 __vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
-	struct vm_area_struct *prev)
+	struct vm_area_struct *prev, struct rb_node **rb_link,
+	struct rb_node *rb_parent)
 {
-	__vma_link_list(mm, vma, prev);
+	__vma_link_list(mm, vma, prev, rb_parent);
+	__vma_link_rb(mm, vma, rb_link, rb_parent);
 }
 
-static int vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
-			struct vm_area_struct *prev)
+static void vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
+			struct vm_area_struct *prev, struct rb_node **rb_link,
+			struct rb_node *rb_parent)
 {
 	struct address_space *mapping = NULL;
-	MA_STATE(mas, &mm->mm_mt, vma->vm_start, vma->vm_end - 1);
-
-	if (mas_preallocate(&mas, vma, GFP_KERNEL))
-		return -ENOMEM;
 
 	if (vma->vm_file) {
 		mapping = vma->vm_file->f_mapping;
 		i_mmap_lock_write(mapping);
 	}
 
-	__vma_link(mm, vma, prev);
-	vma_mas_store(vma, &mas);
+	__vma_link(mm, vma, prev, rb_link, rb_parent);
 	__vma_link_file(vma);
 
 	if (mapping)
@@ -467,23 +631,21 @@ static int vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
 
 	mm->map_count++;
 	validate_mm(mm);
-	return 0;
 }
 
 /*
  * Helper for vma_adjust() in the split_vma insert case: insert a vma into the
  * mm's list and rbtree.  It has already been inserted into the interval tree.
  */
-static void __insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma,
-			       struct ma_state *mas,
-			       struct vm_area_struct *prev)
+static void __insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
 {
-	/* vma's range must be a maple hole (its split sibling is
-	 * restored separately). */
-	if (find_vma_intersection(mm, vma->vm_start, vma->vm_end))
+	struct vm_area_struct *prev;
+	struct rb_node **rb_link, *rb_parent;
+
+	if (find_vma_links(mm, vma->vm_start, vma->vm_end,
+			   &prev, &rb_link, &rb_parent))
 		BUG();
-	__vma_link(mm, vma, prev);
-	vma_mas_store(vma, mas);
+	__vma_link(mm, vma, prev, rb_link, rb_parent);
 	mm->map_count++;
 }
 
@@ -495,11 +657,7 @@ static __always_inline void __vma_unlink_common(struct mm_struct *mm,
 {
 	struct vm_area_struct *next;
 
-	(void)ignore;
-	{
-		MA_STATE(mas, &mm->mm_mt, vma->vm_start, vma->vm_start);
-		mas_erase(&mas);
-	}
+	vma_rb_erase_ignore(vma, &mm->mm_rb, ignore);
 	next = vma->vm_next;
 	if (has_prev)
 		prev->vm_next = next;
@@ -512,6 +670,9 @@ static __always_inline void __vma_unlink_common(struct mm_struct *mm,
 	}
 	if (next)
 		next->vm_prev = prev;
+
+	/* Kill the cache */
+	vmacache_invalidate(mm);
 }
 
 static inline void __vma_unlink_prev(struct mm_struct *mm,
@@ -538,15 +699,9 @@ int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
 	struct rb_root_cached *root = NULL;
 	struct anon_vma *anon_vma = NULL;
 	struct file *file = vma->vm_file;
+	bool start_changed = false, end_changed = false;
 	long adjust_next = 0;
 	int remove_next = 0;
-	/* Dual-maintain mm_mt through in-place boundary changes. The
-	 * preallocated states below are consumed by the restore stores;
-	 * preallocation happens before any mutation so ENOMEM unwinds
-	 * cleanly with both trees untouched. */
-	MA_STATE(mas, &mm->mm_mt, 0, 0);
-	MA_STATE(mas_next, &mm->mm_mt, 0, 0);
-	MA_STATE(mas_insert, &mm->mm_mt, 0, 0);
 
 	if (next && !insert) {
 		struct vm_area_struct *exporter = NULL, *importer = NULL;
@@ -667,32 +822,6 @@ again:
 			anon_vma_interval_tree_pre_update_vma(next);
 	}
 
-	/*
-	 * Preallocate maple nodes before touching either tree: on
-	 * ENOMEM nothing has been mutated yet, so the caller can
-	 * unwind cleanly (this mirrors the vma_link() ordering).
-	 */
-	mas_set_range(&mas, start, end - 1);
-	if (mas_preallocate(&mas, vma, GFP_KERNEL))
-		return -ENOMEM;
-	if (insert) {
-		mas_set_range(&mas_insert, insert->vm_start,
-			      insert->vm_end - 1);
-		if (mas_preallocate(&mas_insert, insert, GFP_KERNEL)) {
-			mas_destroy(&mas);
-			return -ENOMEM;
-		}
-	}
-	if (adjust_next && !remove_next) {
-		mas_set_range(&mas_next, next->vm_start, next->vm_end - 1);
-		if (mas_preallocate(&mas_next, next, GFP_KERNEL)) {
-			mas_destroy(&mas);
-			if (insert)
-				mas_destroy(&mas_insert);
-			return -ENOMEM;
-		}
-	}
-
 	if (root) {
 		flush_dcache_mmap_lock(mapping);
 		vma_interval_tree_remove(vma, root);
@@ -700,26 +829,14 @@ again:
 			vma_interval_tree_remove(next, root);
 	}
 
-	/*
-	 * Dual-maintain mm_mt: erase the old ranges before mutating
-	 * them in place. Erase is self-contained (internal GFP_KERNEL
-	 * retry) and a no-op if the entry is already gone.
-	 */
-	{
-		MA_STATE(mas_del, &mm->mm_mt, vma->vm_start,
-			 vma->vm_start);
-		mas_erase(&mas_del);
-		if (adjust_next) {
-			MA_STATE(mas_del_next, &mm->mm_mt,
-				 next->vm_start, next->vm_start);
-			mas_erase(&mas_del_next);
-		}
-	}
-
-	if (start != vma->vm_start)
+	if (start != vma->vm_start) {
 		vma->vm_start = start;
-	if (end != vma->vm_end)
+		start_changed = true;
+	}
+	if (end != vma->vm_end) {
 		vma->vm_end = end;
+		end_changed = true;
+	}
 	vma->vm_pgoff = pgoff;
 	if (adjust_next) {
 		next->vm_start += adjust_next << PAGE_SHIFT;
@@ -744,6 +861,11 @@ again:
 			/*
 			 * vma is not before next if they've been
 			 * swapped.
+			 *
+			 * pre-swap() next->vm_start was reduced so
+			 * tell validate_mm_rb to ignore pre-swap()
+			 * "next" (which is stored in post-swap()
+			 * "vma").
 			 */
 			__vma_unlink_common(mm, next, NULL, false, vma);
 		if (file)
@@ -753,31 +875,18 @@ again:
 		 * split_vma has split insert from vma, and needs
 		 * us to insert it before dropping the locks
 		 * (it may either follow vma or precede it).
-		 * vma is still list-linked with its final bounds but
-		 * its old range was already erased from the maple
-		 * tree, so the predecessor must come from vma itself
-		 * (the two are exactly adjacent), not from a tree
-		 * walk which cannot see vma.
 		 */
-		struct vm_area_struct *insert_prev;
-
-		if (insert->vm_start == vma->vm_end)
-			insert_prev = vma;
-		else {
-			VM_WARN_ON(insert->vm_end != vma->vm_start);
-			insert_prev = vma->vm_prev;
+		__insert_vm_struct(mm, insert);
+	} else {
+		if (start_changed)
+			vma_gap_update(vma);
+		if (end_changed) {
+			if (!next)
+				mm->highest_vm_end = vm_end_gap(vma);
+			else if (!adjust_next)
+				vma_gap_update(next);
 		}
-		__insert_vm_struct(mm, insert, &mas_insert, insert_prev);
 	}
-
-	/*
-	 * Dual-maintain mm_mt: re-store the surviving VMA(s) with their
-	 * final bounds, consuming the preallocated nodes. Unlinked VMAs
-	 * were already erased (explicitly above, or via the unlink paths).
-	 */
-	vma_mas_store(vma, &mas);
-	if (adjust_next && !remove_next)
-		vma_mas_store(next, &mas_next);
 
 	if (anon_vma) {
 		anon_vma_interval_tree_post_update_vma(vma);
@@ -836,7 +945,9 @@ again:
 			end = next->vm_end;
 			goto again;
 		}
-		else if (!next) {
+		else if (next)
+			vma_gap_update(next);
+		else {
 			/*
 			 * If remove_next == 2 we obviously can't
 			 * reach this path.
@@ -850,8 +961,13 @@ again:
 			 *
 			 * We reach this only in the remove_next == 1
 			 * case if the "next" vma that was removed was
-			 * the highest vma of the mm.
+			 * the highest vma of the mm. However in such
+			 * case next->vm_end == "end" and the extended
+			 * "vma" has vma->vm_end == next->vm_end so
+			 * mm->highest_vm_end doesn't need any update
+			 * in remove_next == 1 case.
 			 */
+			VM_WARN_ON(mm->highest_vm_end != vm_end_gap(vma));
 		}
 	}
 	if (insert && file)
@@ -1580,6 +1696,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma, *prev;
 	int error;
+	struct rb_node **rb_link, *rb_parent;
 	unsigned long charged = 0;
 
 	/* Check against address space limit. */
@@ -1598,12 +1715,11 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	}
 
 	/* Clear old maps */
-	while (find_vma_intersection(mm, addr, addr + len)) {
+	while (find_vma_links(mm, addr, addr + len, &prev, &rb_link,
+			      &rb_parent)) {
 		if (do_munmap(mm, addr, len, uf))
 			return -ENOMEM;
 	}
-
-	find_vma_prev(mm, addr, &prev);
 
 	/*
 	 * Private writable mapping: check memory availability
@@ -1666,12 +1782,13 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 		 *
 		 * Answer: Yes, several device drivers can do it in their
 		 *         f_op->mmap method. -DaveM
+		 * Bug: If addr is changed, prev, rb_link, rb_parent should
+		 *      be updated for vma_link()
 		 */
 		WARN_ON_ONCE(addr != vma->vm_start);
 
 		addr = vma->vm_start;
 		vm_flags = vma->vm_flags;
-		find_vma_prev(mm, addr, &prev);
 	} else if (vm_flags & VM_SHARED) {
 		error = shmem_zero_setup(vma);
 		if (error)
@@ -1680,9 +1797,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 		vma_set_anonymous(vma);
 	}
 
-	error = vma_link(mm, vma, prev);
-	if (error)
-		goto free_vma;
+	vma_link(mm, vma, prev, rb_link, rb_parent);
 	/* Once vma denies write, undo our temporary denial count */
 	if (file) {
 		if (vm_flags & VM_SHARED)
@@ -1740,55 +1855,207 @@ unacct_error:
 	return error;
 }
 
-/**
- * unmapped_area() - Find an area between the low_limit and the high_limit
- * with the correct alignment and offset, all from @info. Note:
- * current->mm is used for the search.
- *
- * @info: The unmapped area information including the range (low_limit -
- * hight_limit), the alignment offset and mask.
- *
- * Return: A memory address or -ENOMEM.
- */
 unsigned long unmapped_area(struct vm_unmapped_area_info *info)
 {
-	unsigned long length, gap;
+	/*
+	 * We implement the search by looking for an rbtree node that
+	 * immediately follows a suitable gap. That is,
+	 * - gap_start = vma->vm_prev->vm_end <= info->high_limit - length;
+	 * - gap_end   = vma->vm_start        >= info->low_limit  + length;
+	 * - gap_end - gap_start >= length
+	 */
 
-	MA_STATE(mas, &current->mm->mm_mt, 0, 0);
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	unsigned long length, low_limit, high_limit, gap_start, gap_end;
 
 	/* Adjust search length to account for worst case alignment overhead */
 	length = info->length + info->align_mask;
 	if (length < info->length)
 		return -ENOMEM;
 
-	if (mas_empty_area(&mas, info->low_limit, info->high_limit - 1,
-				  length))
+	/* Adjust search limits by the desired length */
+	if (info->high_limit < length)
+		return -ENOMEM;
+	high_limit = info->high_limit - length;
+
+	if (info->low_limit > high_limit)
+		return -ENOMEM;
+	low_limit = info->low_limit + length;
+
+	/* Check if rbtree root looks promising */
+	if (RB_EMPTY_ROOT(&mm->mm_rb))
+		goto check_highest;
+	vma = rb_entry(mm->mm_rb.rb_node, struct vm_area_struct, vm_rb);
+	if (vma->rb_subtree_gap < length)
+		goto check_highest;
+
+	while (true) {
+		/* Visit left subtree if it looks promising */
+		gap_end = vm_start_gap(vma);
+		if (gap_end >= low_limit && vma->vm_rb.rb_left) {
+			struct vm_area_struct *left =
+				rb_entry(vma->vm_rb.rb_left,
+					 struct vm_area_struct, vm_rb);
+			if (left->rb_subtree_gap >= length) {
+				vma = left;
+				continue;
+			}
+		}
+
+		gap_start = vma->vm_prev ? vm_end_gap(vma->vm_prev) : 0;
+check_current:
+		/* Check if current node has a suitable gap */
+		if (gap_start > high_limit)
+			return -ENOMEM;
+		if (gap_end >= low_limit &&
+		    gap_end > gap_start && gap_end - gap_start >= length)
+			goto found;
+
+		/* Visit right subtree if it looks promising */
+		if (vma->vm_rb.rb_right) {
+			struct vm_area_struct *right =
+				rb_entry(vma->vm_rb.rb_right,
+					 struct vm_area_struct, vm_rb);
+			if (right->rb_subtree_gap >= length) {
+				vma = right;
+				continue;
+			}
+		}
+
+		/* Go back up the rbtree to find next candidate node */
+		while (true) {
+			struct rb_node *prev = &vma->vm_rb;
+			if (!rb_parent(prev))
+				goto check_highest;
+			vma = rb_entry(rb_parent(prev),
+				       struct vm_area_struct, vm_rb);
+			if (prev == vma->vm_rb.rb_left) {
+				gap_start = vm_end_gap(vma->vm_prev);
+				gap_end = vm_start_gap(vma);
+				goto check_current;
+			}
+		}
+	}
+
+check_highest:
+	/* Check highest gap, which does not precede any rbtree node */
+	gap_start = mm->highest_vm_end;
+	gap_end = ULONG_MAX;  /* Only for VM_BUG_ON below */
+	if (gap_start > high_limit)
 		return -ENOMEM;
 
-	gap = mas.index;
-	gap += (info->align_offset - gap) & info->align_mask;
-	return gap;
+found:
+	/* We found a suitable gap. Clip it with the original low_limit. */
+	if (gap_start < info->low_limit)
+		gap_start = info->low_limit;
+
+	/* Adjust gap address to the desired alignment */
+	gap_start += (info->align_offset - gap_start) & info->align_mask;
+
+	VM_BUG_ON(gap_start + info->length > info->high_limit);
+	VM_BUG_ON(gap_start + info->length > gap_end);
+	return gap_start;
 }
 
 unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
 {
-	unsigned long length, gap;
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	unsigned long length, low_limit, high_limit, gap_start, gap_end;
 
-	MA_STATE(mas, &current->mm->mm_mt, 0, 0);
 	/* Adjust search length to account for worst case alignment overhead */
 	length = info->length + info->align_mask;
 	if (length < info->length)
 		return -ENOMEM;
 
-	if (mas_empty_area_rev(&mas, info->low_limit, info->high_limit - 1,
-				length))
+	/*
+	 * Adjust search limits by the desired length.
+	 * See implementation comment at top of unmapped_area().
+	 */
+	gap_end = info->high_limit;
+	if (gap_end < length)
+		return -ENOMEM;
+	high_limit = gap_end - length;
+
+	if (info->low_limit > high_limit)
+		return -ENOMEM;
+	low_limit = info->low_limit + length;
+
+	/* Check highest gap, which does not precede any rbtree node */
+	gap_start = mm->highest_vm_end;
+	if (gap_start <= high_limit)
+		goto found_highest;
+
+	/* Check if rbtree root looks promising */
+	if (RB_EMPTY_ROOT(&mm->mm_rb))
+		return -ENOMEM;
+	vma = rb_entry(mm->mm_rb.rb_node, struct vm_area_struct, vm_rb);
+	if (vma->rb_subtree_gap < length)
 		return -ENOMEM;
 
-	gap = mas.last + 1 - info->length;
-	gap -= (gap - info->align_offset) & info->align_mask;
-	return gap;
-}
+	while (true) {
+		/* Visit right subtree if it looks promising */
+		gap_start = vma->vm_prev ? vm_end_gap(vma->vm_prev) : 0;
+		if (gap_start <= high_limit && vma->vm_rb.rb_right) {
+			struct vm_area_struct *right =
+				rb_entry(vma->vm_rb.rb_right,
+					 struct vm_area_struct, vm_rb);
+			if (right->rb_subtree_gap >= length) {
+				vma = right;
+				continue;
+			}
+		}
 
+check_current:
+		/* Check if current node has a suitable gap */
+		gap_end = vm_start_gap(vma);
+		if (gap_end < low_limit)
+			return -ENOMEM;
+		if (gap_start <= high_limit &&
+		    gap_end > gap_start && gap_end - gap_start >= length)
+			goto found;
+
+		/* Visit left subtree if it looks promising */
+		if (vma->vm_rb.rb_left) {
+			struct vm_area_struct *left =
+				rb_entry(vma->vm_rb.rb_left,
+					 struct vm_area_struct, vm_rb);
+			if (left->rb_subtree_gap >= length) {
+				vma = left;
+				continue;
+			}
+		}
+
+		/* Go back up the rbtree to find next candidate node */
+		while (true) {
+			struct rb_node *prev = &vma->vm_rb;
+			if (!rb_parent(prev))
+				return -ENOMEM;
+			vma = rb_entry(rb_parent(prev),
+				       struct vm_area_struct, vm_rb);
+			if (prev == vma->vm_rb.rb_right) {
+				gap_start = vma->vm_prev ?
+					vm_end_gap(vma->vm_prev) : 0;
+				goto check_current;
+			}
+		}
+	}
+
+found:
+	/* We found a suitable gap. Clip it with the original high_limit. */
+	if (gap_end > info->high_limit)
+		gap_end = info->high_limit;
+
+found_highest:
+	/* Compute highest gap address at the desired alignment */
+	gap_end -= info->length;
+	gap_end -= (gap_end - info->align_offset) & info->align_mask;
+
+	VM_BUG_ON(gap_end < info->low_limit);
+	VM_BUG_ON(gap_end < gap_start);
+	return gap_end;
+}
 EXPORT_SYMBOL_GPL(unmapped_area_topdown);
 
 /* Get an address range which is currently unmapped.
@@ -1941,10 +2208,33 @@ EXPORT_SYMBOL(get_unmapped_area);
 /* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
 struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
 {
-	unsigned long index = addr;
+	struct rb_node *rb_node;
+	struct vm_area_struct *vma;
 
-	lockdep_assert_held(&mm->mmap_sem);
-	return mt_find(&mm->mm_mt, &index, ULONG_MAX);
+	/* Check the cache first. */
+	vma = vmacache_find(mm, addr);
+	if (likely(vma))
+		return vma;
+
+	rb_node = mm->mm_rb.rb_node;
+
+	while (rb_node) {
+		struct vm_area_struct *tmp;
+
+		tmp = rb_entry(rb_node, struct vm_area_struct, vm_rb);
+
+		if (tmp->vm_end > addr) {
+			vma = tmp;
+			if (tmp->vm_start <= addr)
+				break;
+			rb_node = rb_node->rb_left;
+		} else
+			rb_node = rb_node->rb_right;
+	}
+
+	if (vma)
+		vmacache_update(addr, vma);
+	return vma;
 }
 
 EXPORT_SYMBOL(find_vma);
@@ -1957,13 +2247,18 @@ find_vma_prev(struct mm_struct *mm, unsigned long addr,
 			struct vm_area_struct **pprev)
 {
 	struct vm_area_struct *vma;
-	MA_STATE(mas, &mm->mm_mt, addr, addr);
 
-	lockdep_assert_held(&mm->mmap_sem);
-	vma = mas_walk(&mas);
-	*pprev = mas_prev(&mas, 0);
-	if (!vma)
-		vma = mas_next(&mas, ULONG_MAX);
+	vma = find_vma(mm, addr);
+	if (vma) {
+		*pprev = vma->vm_prev;
+	} else {
+		struct rb_node *rb_node = mm->mm_rb.rb_node;
+		*pprev = NULL;
+		while (rb_node) {
+			*pprev = rb_entry(rb_node, struct vm_area_struct, vm_rb);
+			rb_node = rb_node->rb_right;
+		}
+	}
 	return vma;
 }
 
@@ -2024,7 +2319,6 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
 	struct vm_area_struct *next;
 	unsigned long gap_addr;
 	int error = 0;
-	MA_STATE(mas, &mm->mm_mt, 0, 0);
 
 	if (!(vma->vm_flags & VM_GROWSUP))
 		return -EFAULT;
@@ -2073,23 +2367,10 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
 			error = acct_stack_growth(vma, size, grow);
 			if (!error) {
 				/*
-				 * Dual-maintain mm_mt: preallocate first so
-				 * ENOMEM unwinds before any mutation (GFP_KERNEL
-				 * is safe here; this path already sleeps in
-				 * acct_stack_growth()).
-				 */
-				mas_set_range(&mas, vma->vm_start, address - 1);
-				if (mas_preallocate(&mas, vma, GFP_KERNEL))
-					error = -ENOMEM;
-			}
-			if (!error) {
-				MA_STATE(mas_del, &mm->mm_mt,
-					 vma->vm_start, vma->vm_start);
-				mas_erase(&mas_del);
-				/*
-				 * We only hold a shared mmap_sem lock here,
-				 * so we need to protect against concurrent
-				 * vma expansions.
+				 * vma_gap_update() doesn't support concurrent
+				 * updates, but we only hold a shared mmap_sem
+				 * lock here, so we need to protect against
+				 * concurrent vma expansions.
 				 * anon_vma_lock_write() doesn't help here, as
 				 * we don't guarantee that all growable vmas
 				 * in a mm share the same root anon vma.
@@ -2103,8 +2384,11 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
 				anon_vma_interval_tree_pre_update_vma(vma);
 				vma->vm_end = address;
 				anon_vma_interval_tree_post_update_vma(vma);
+				if (vma->vm_next)
+					vma_gap_update(vma->vm_next);
+				else
+					mm->highest_vm_end = vm_end_gap(vma);
 				spin_unlock(&mm->page_table_lock);
-				vma_mas_store(vma, &mas);
 
 				perf_event_mmap(vma);
 			}
@@ -2126,7 +2410,6 @@ int expand_downwards(struct vm_area_struct *vma,
 	struct mm_struct *mm = vma->vm_mm;
 	struct vm_area_struct *prev;
 	int error = 0;
-	MA_STATE(mas, &mm->mm_mt, 0, 0);
 
 	address &= PAGE_MASK;
 	if (address < mmap_min_addr)
@@ -2164,23 +2447,10 @@ int expand_downwards(struct vm_area_struct *vma,
 			error = acct_stack_growth(vma, size, grow);
 			if (!error) {
 				/*
-				 * Dual-maintain mm_mt: preallocate first so
-				 * ENOMEM unwinds before any mutation (GFP_KERNEL
-				 * is safe here; this path already sleeps in
-				 * acct_stack_growth()).
-				 */
-				mas_set_range(&mas, address, vma->vm_end - 1);
-				if (mas_preallocate(&mas, vma, GFP_KERNEL))
-					error = -ENOMEM;
-			}
-			if (!error) {
-				MA_STATE(mas_del, &mm->mm_mt,
-					 vma->vm_start, vma->vm_start);
-				mas_erase(&mas_del);
-				/*
-				 * We only hold a shared mmap_sem lock here,
-				 * so we need to protect against concurrent
-				 * vma expansions.
+				 * vma_gap_update() doesn't support concurrent
+				 * updates, but we only hold a shared mmap_sem
+				 * lock here, so we need to protect against
+				 * concurrent vma expansions.
 				 * anon_vma_lock_write() doesn't help here, as
 				 * we don't guarantee that all growable vmas
 				 * in a mm share the same root anon vma.
@@ -2195,8 +2465,8 @@ int expand_downwards(struct vm_area_struct *vma,
 				vma->vm_start = address;
 				vma->vm_pgoff -= grow;
 				anon_vma_interval_tree_post_update_vma(vma);
+				vma_gap_update(vma);
 				spin_unlock(&mm->page_table_lock);
-				vma_mas_store(vma, &mas);
 
 				perf_event_mmap(vma);
 			}
@@ -2339,19 +2609,21 @@ detach_vmas_to_be_unmapped(struct mm_struct *mm, struct vm_area_struct *vma,
 	insertion_point = (prev ? &prev->vm_next : &mm->mmap);
 	vma->vm_prev = NULL;
 	do {
-		{
-			MA_STATE(mas, &mm->mm_mt, vma->vm_start,
-				 vma->vm_start);
-			mas_erase(&mas);
-		}
+		vma_rb_erase(vma, &mm->mm_rb);
 		mm->map_count--;
 		tail_vma = vma;
 		vma = vma->vm_next;
 	} while (vma && vma->vm_start < end);
 	*insertion_point = vma;
-	if (vma)
+	if (vma) {
 		vma->vm_prev = prev;
+		vma_gap_update(vma);
+	} else
+		mm->highest_vm_end = prev ? vm_end_gap(prev) : 0;
 	tail_vma->vm_next = NULL;
+
+	/* Kill the cache */
+	vmacache_invalidate(mm);
 }
 
 /*
@@ -2680,6 +2952,7 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma, *prev;
+	struct rb_node **rb_link, *rb_parent;
 	pgoff_t pgoff = addr >> PAGE_SHIFT;
 	int error;
 
@@ -2705,11 +2978,11 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 	/*
 	 * Clear old maps.  this also does some error checking for us
 	 */
-	while (find_vma_intersection(mm, addr, addr + len)) {
+	while (find_vma_links(mm, addr, addr + len, &prev, &rb_link,
+			      &rb_parent)) {
 		if (do_munmap(mm, addr, len, uf))
 			return -ENOMEM;
 	}
-	vma = find_vma_prev(mm, addr, &prev);
 
 	/* Check against address space limits *after* clearing old maps... */
 	if (!may_expand_vm(mm, flags, len >> PAGE_SHIFT))
@@ -2742,11 +3015,7 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 	vma->vm_pgoff = pgoff;
 	vma->vm_flags = flags;
 	vma->vm_page_prot = vm_get_page_prot(flags);
-	if (vma_link(mm, vma, prev)) {
-		vm_area_free(vma);
-		vm_unacct_memory(len >> PAGE_SHIFT);
-		return -ENOMEM;
-	}
+	vma_link(mm, vma, prev, rb_link, rb_parent);
 out:
 	perf_event_mmap(vma);
 	mm->total_vm += len >> PAGE_SHIFT;
@@ -2858,12 +3127,6 @@ void exit_mmap(struct mm_struct *mm)
 		vma = remove_vma(vma);
 		cond_resched();
 	}
-#ifdef CONFIG_MAPLE_TREE
-	/* Drop the dual-maintained tree with the mm. All entries were
-	 * already unlinked above; this frees any remaining maple nodes
-	 * back to the maple_node_cache slab. */
-	mtree_destroy(&mm->mm_mt);
-#endif
 	vm_unacct_memory(nr_accounted);
 }
 
@@ -2873,14 +3136,14 @@ void exit_mmap(struct mm_struct *mm)
  */
 int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
 {
-	struct vm_area_struct *prev, *next;
-	unsigned long charged = vma_pages(vma);
+	struct vm_area_struct *prev;
+	struct rb_node **rb_link, *rb_parent;
 
-	next = find_vma_prev(mm, vma->vm_start, &prev);
-	if (next && next->vm_start < vma->vm_end)
+	if (find_vma_links(mm, vma->vm_start, vma->vm_end,
+			   &prev, &rb_link, &rb_parent))
 		return -ENOMEM;
 	if ((vma->vm_flags & VM_ACCOUNT) &&
-	     security_vm_enough_memory_mm(mm, charged))
+	     security_vm_enough_memory_mm(mm, vma_pages(vma)))
 		return -ENOMEM;
 
 	/*
@@ -2900,10 +3163,7 @@ int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
 		vma->vm_pgoff = vma->vm_start >> PAGE_SHIFT;
 	}
 
-	if (vma_link(mm, vma, prev)) {
-		vm_unacct_memory(charged);
-		return -ENOMEM;
-	}
+	vma_link(mm, vma, prev, rb_link, rb_parent);
 	return 0;
 }
 
@@ -2919,6 +3179,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 	unsigned long vma_start = vma->vm_start;
 	struct mm_struct *mm = vma->vm_mm;
 	struct vm_area_struct *new_vma, *prev;
+	struct rb_node **rb_link, *rb_parent;
 	bool faulted_in_anon_vma = true;
 	bool can_self_merge = false;
 
@@ -2932,8 +3193,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 		can_self_merge = true;
 	}
 
-	new_vma = find_vma_prev(mm, addr, &prev);
-	if (new_vma && new_vma->vm_start < addr + len)
+	if (find_vma_links(mm, addr, addr + len, &prev, &rb_link, &rb_parent))
 		return NULL;	/* should never get here */
 
 	/*
@@ -2989,18 +3249,11 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 			get_file(new_vma->vm_file);
 		if (new_vma->vm_ops && new_vma->vm_ops->open)
 			new_vma->vm_ops->open(new_vma);
-		if (vma_link(mm, new_vma, prev))
-			goto out_vma_link;
+		vma_link(mm, new_vma, prev, rb_link, rb_parent);
 		*need_rmap_locks = false;
 	}
 	return new_vma;
 
-out_vma_link:
-	if (new_vma->vm_ops && new_vma->vm_ops->close)
-		new_vma->vm_ops->close(new_vma);
-	if (new_vma->vm_file)
-		fput(new_vma->vm_file);
-	unlink_anon_vmas(new_vma);
 out_free_mempol:
 	mpol_put(vma_policy(new_vma));
 out_free_vma:

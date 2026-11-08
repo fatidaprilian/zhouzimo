@@ -18,6 +18,7 @@
 #include <linux/export.h>
 #include <linux/mm.h>
 #include <linux/sched/mm.h>
+#include <linux/vmacache.h>
 #include <linux/mman.h>
 #include <linux/swap.h>
 #include <linux/file.h>
@@ -656,9 +657,9 @@ static void put_nommu_region(struct vm_region *region)
  */
 static void add_vma_to_mm(struct mm_struct *mm, struct vm_area_struct *vma)
 {
-	struct vm_area_struct *prev = NULL, *iter;
+	struct vm_area_struct *pvma, *prev;
 	struct address_space *mapping;
-	MA_STATE(mas, &mm->mm_mt, vma->vm_start, vma->vm_end - 1);
+	struct rb_node **p, *parent, *rb_prev;
 
 	BUG_ON(!vma->vm_region);
 
@@ -676,16 +677,43 @@ static void add_vma_to_mm(struct mm_struct *mm, struct vm_area_struct *vma)
 		i_mmap_unlock_write(mapping);
 	}
 
-	/* add the VMA to the list, sorted by start address */
-	for (iter = mm->mmap; iter && iter->vm_start < vma->vm_start;
-	     iter = iter->vm_next)
-		prev = iter;
+	/* add the VMA to the tree */
+	parent = rb_prev = NULL;
+	p = &mm->mm_rb.rb_node;
+	while (*p) {
+		parent = *p;
+		pvma = rb_entry(parent, struct vm_area_struct, vm_rb);
 
-	__vma_link_list(mm, vma, prev);
+		/* sort by: start addr, end addr, VMA struct addr in that order
+		 * (the latter is necessary as we may get identical VMAs) */
+		if (vma->vm_start < pvma->vm_start)
+			p = &(*p)->rb_left;
+		else if (vma->vm_start > pvma->vm_start) {
+			rb_prev = parent;
+			p = &(*p)->rb_right;
+		} else if (vma->vm_end < pvma->vm_end)
+			p = &(*p)->rb_left;
+		else if (vma->vm_end > pvma->vm_end) {
+			rb_prev = parent;
+			p = &(*p)->rb_right;
+		} else if (vma < pvma)
+			p = &(*p)->rb_left;
+		else if (vma > pvma) {
+			rb_prev = parent;
+			p = &(*p)->rb_right;
+		} else
+			BUG();
+	}
 
-	/* add the VMA to the maple tree */
-	if (mas_store_gfp(&mas, vma, GFP_KERNEL))
-		BUG();
+	rb_link_node(&vma->vm_rb, parent, p);
+	rb_insert_color(&vma->vm_rb, &mm->mm_rb);
+
+	/* add VMA to the VMA list also */
+	prev = NULL;
+	if (rb_prev)
+		prev = rb_entry(rb_prev, struct vm_area_struct, vm_rb);
+
+	__vma_link_list(mm, vma, prev, parent);
 }
 
 /*
@@ -693,14 +721,22 @@ static void add_vma_to_mm(struct mm_struct *mm, struct vm_area_struct *vma)
  */
 static void delete_vma_from_mm(struct vm_area_struct *vma)
 {
+	int i;
+	struct address_space *mapping;
 	struct mm_struct *mm = vma->vm_mm;
+	struct task_struct *curr = current;
 
 	mm->map_count--;
+	for (i = 0; i < VMACACHE_SIZE; i++) {
+		/* if the vma is cached, invalidate the entire cache */
+		if (curr->vmacache.vmas[i] == vma) {
+			vmacache_invalidate(mm);
+			break;
+		}
+	}
 
 	/* remove the VMA from the mapping */
 	if (vma->vm_file) {
-		struct address_space *mapping;
-
 		mapping = vma->vm_file->f_mapping;
 
 		i_mmap_lock_write(mapping);
@@ -711,10 +747,7 @@ static void delete_vma_from_mm(struct vm_area_struct *vma)
 	}
 
 	/* remove from the MM's tree and list */
-	{
-		MA_STATE(mas, &mm->mm_mt, vma->vm_start, vma->vm_start);
-		mas_erase(&mas);
-	}
+	rb_erase(&vma->vm_rb, &mm->mm_rb);
 
 	if (vma->vm_prev)
 		vma->vm_prev->vm_next = vma->vm_next;
@@ -744,9 +777,25 @@ static void delete_vma(struct mm_struct *mm, struct vm_area_struct *vma)
  */
 struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
 {
-	MA_STATE(mas, &mm->mm_mt, addr, addr);
+	struct vm_area_struct *vma;
 
-	return mas_walk(&mas);
+	/* check the cache first */
+	vma = vmacache_find(mm, addr);
+	if (likely(vma))
+		return vma;
+
+	/* trawl the list (there may be multiple mappings in which addr
+	 * resides) */
+	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+		if (vma->vm_start > addr)
+			return NULL;
+		if (vma->vm_end > addr) {
+			vmacache_update(addr, vma);
+			return vma;
+		}
+	}
+
+	return NULL;
 }
 EXPORT_SYMBOL(find_vma);
 
@@ -778,17 +827,26 @@ static struct vm_area_struct *find_vma_exact(struct mm_struct *mm,
 {
 	struct vm_area_struct *vma;
 	unsigned long end = addr + len;
-	MA_STATE(mas, &mm->mm_mt, addr, addr);
 
-	vma = mas_walk(&mas);
-	if (!vma)
-		return NULL;
-	if (vma->vm_start != addr)
-		return NULL;
-	if (vma->vm_end != end)
-		return NULL;
+	/* check the cache first */
+	vma = vmacache_find_exact(mm, addr, end);
+	if (vma)
+		return vma;
 
-	return vma;
+	/* trawl the list (there may be multiple mappings in which addr
+	 * resides) */
+	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+		if (vma->vm_start < addr)
+			continue;
+		if (vma->vm_start > addr)
+			return NULL;
+		if (vma->vm_end == end) {
+			vmacache_update(addr, vma);
+			return vma;
+		}
+	}
+
+	return NULL;
 }
 
 /*

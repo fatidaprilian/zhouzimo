@@ -9,9 +9,6 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/rbtree.h>
-#ifdef CONFIG_MAPLE_TREE
-#include <linux/maple_tree.h>
-#endif
 #include <linux/rwsem.h>
 #include <linux/completion.h>
 #include <linux/cpumask.h>
@@ -290,9 +287,14 @@ struct vm_area_struct {
 	/* linked list of VM areas per task, sorted by address */
 	struct vm_area_struct *vm_next, *vm_prev;
 
-	/* KABI dummy padding - do not use. Preserves struct layout for
-	 * out-of-tree vendor modules after the rbtree removal. */
 	struct rb_node vm_rb;
+
+	/*
+	 * Largest free memory gap in bytes to the left of this VMA.
+	 * Either between this VMA and vma->vm_prev, or between one of the
+	 * VMAs below us in the VMA rbtree and its ->vm_prev. This helps
+	 * get_unmapped_area find a free area of the right size.
+	 */
 	unsigned long rb_subtree_gap;
 
 	/* Second cache line starts here. */
@@ -363,21 +365,10 @@ struct core_state {
 };
 
 struct kioctx_table;
-
-#ifdef CONFIG_MAPLE_TREE
-#define MM_MT_FLAGS	(MT_FLAGS_ALLOC_RANGE | MT_FLAGS_LOCK_EXTERN | \
-			 MT_FLAGS_USE_RCU)
-#endif
-
 struct mm_struct {
 	struct {
 		struct vm_area_struct *mmap;		/* list of VMAs */
-		/* KABI dummy padding - do not use. */
 		struct rb_root mm_rb;
-#ifdef CONFIG_MAPLE_TREE
-		/* Maple tree store for VMAs, keyed by address range. */
-		struct maple_tree mm_mt;
-#endif
 		u64 vmacache_seqnum;                   /* per-thread vmacache */
 #ifdef CONFIG_MMU
 		unsigned long (*get_unmapped_area) (struct file *filp,
@@ -392,6 +383,7 @@ struct mm_struct {
 		unsigned long mmap_compat_legacy_base;
 #endif
 		unsigned long task_size;	/* size of task vm space */
+		unsigned long highest_vm_end;	/* highest vma end address */
 		pgd_t * pgd;
 
 		/**
