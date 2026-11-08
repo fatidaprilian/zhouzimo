@@ -45,6 +45,16 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 	struct cfs_rq *cfs_rq = &rq->cfs;
 	unsigned long est;
 
+	/*
+	 * Idle CPUs have no active CFS tasks; any residual cfs_rq util_avg
+	 * or util_est is decaying historical load that would otherwise make
+	 * an idle CPU appear busier than an active uclamp-clamped CPU.
+	 */
+	if (c->exit_lat) {
+		c->util = 0;
+		goto skip_cfs_util;
+	}
+
 	/* Get this CPU's utilization from CFS tasks */
 	c->util = READ_ONCE(cfs_rq->avg.util_avg);
 	if (sched_feat(UTIL_EST)) {
@@ -63,6 +73,7 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 	if (sync && c->cpu == this_cpu && !rt_task(current))
 		c->util -= min(c->util, task_util(current));
 
+skip_cfs_util:
 	/* Get the utilization of everything other than CFS tasks */
 	c->hard_util = cpu_util_rt(rq) + cpu_util_dl(rq) + cpu_util_irq(rq);
 
@@ -97,11 +108,13 @@ bool cass_prime_cpu(const struct cass_cpu_cand *c)
 static __always_inline
 bool cass_cpu_better(const struct cass_cpu_cand *a,
 		     const struct cass_cpu_cand *b, unsigned long p_util,
-		     int this_cpu, int prev_cpu, int prev_llc_id, bool sync)
+		     int this_cpu, int prev_cpu, int prev_llc_id, bool sync,
+		     bool latency_sensitive)
 {
 #define cass_cmp(a, b) ({ res = (a) - (b); })
 #define cass_eq(a, b) ({ res = (a) == (b); })
 	long res;
+	unsigned int nr_gap = latency_sensitive ? 1 : 2;
 
 	/* Prefer the CPU that's not overloaded */
 	if (cass_cmp(b->eff_util / b->cap_max, a->eff_util / a->cap_max))
@@ -124,13 +137,13 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 
 	/*
 	 * Burst-wake protection: PELT utilization lags behind reality during
-	 * burst wakes. If a CPU has a significantly higher runqueue depth
-	 * (e.g., a gap of 2 or more tasks), penalize it to prevent pile-ups.
+	 * burst wakes. Penalize deeper runqueues immediately for latency-sensitive
+	 * tasks (gap >= 1) while allowing minor packing for normal tasks (gap >= 2).
 	 */
-	if (a->nr_running >= b->nr_running + 2) {
+	if (a->nr_running >= b->nr_running + nr_gap) {
 		res = -1;
 		goto done;
-	} else if (b->nr_running >= a->nr_running + 2) {
+	} else if (b->nr_running >= a->nr_running + nr_gap) {
 		res = 1;
 		goto done;
 	}
@@ -183,6 +196,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 	struct cass_cpu_cand cands[2], *best = cands;
 	int this_cpu = raw_smp_processor_id();
 	unsigned long p_util, uc_min;
+	bool latency_sensitive;
 	bool has_idle = false;
 	int cidx = 0, cpu, prev_llc_id;
 
@@ -192,6 +206,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 	 */
 	p_util = rt ? 0 : task_util_est(p);
 	uc_min = uclamp_eff_value(p, UCLAMP_MIN);
+	latency_sensitive = rt || uclamp_latency_sensitive(p);
 
 	/*
 	 * When the LLC spans all CPUs (e.g. DynamIQ), every candidate shares
@@ -325,7 +340,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		 */
 		if (best == curr ||
 		    cass_cpu_better(curr, best, p_util, this_cpu, prev_cpu,
-				    prev_llc_id, sync)) {
+				    prev_llc_id, sync, latency_sensitive)) {
 			best = curr;
 			cidx ^= 1;
 		}
