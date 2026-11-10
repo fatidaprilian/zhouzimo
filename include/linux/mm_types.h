@@ -363,6 +363,12 @@ struct core_state {
 };
 
 struct kioctx_table;
+
+#ifdef CONFIG_MAPLE_TREE
+#define MM_MT_FLAGS	(MT_FLAGS_ALLOC_RANGE | MT_FLAGS_LOCK_EXTERN | \
+			 MT_FLAGS_USE_RCU)
+#endif
+
 struct mm_struct {
 	struct {
 		struct vm_area_struct *mmap;		/* list of VMAs */

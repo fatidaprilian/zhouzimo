@@ -986,22 +986,27 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 {
 	mm->mmap = NULL;
 	mm->mm_rb = RB_ROOT; /* KABI dummy - keep empty, do not use */
+	mm->vmacache_seqnum = 0;
+	atomic_set(&mm->mm_users, 1);
+	atomic_set(&mm->mm_count, 1);
+	init_rwsem(&mm->mmap_sem);
 #ifdef CONFIG_MAPLE_TREE
 	/*
 	 * Gap tracking must be enabled: without MT_FLAGS_ALLOC_RANGE,
 	 * mas_update_gap() is a no-op (mt_is_alloc() false) and every
 	 * gap search on a populated tree fails with -ENOMEM.
 	 *
+	 * MT_FLAGS_LOCK_EXTERN ensures mas_nomem() does not attempt to
+	 * unlock/lock the internal ma_lock spinlock, which is not held
+	 * because synchronization is provided by mmap_sem.
+	 *
 	 * MT_FLAGS_USE_RCU ensures node destruction is deferred via
 	 * call_rcu() (ma_free_rcu) so concurrent readers in mt_find()
 	 * under rcu_read_lock() never traverse freed memory.
 	 */
-	mt_init_flags(&mm->mm_mt, MT_FLAGS_ALLOC_RANGE | MT_FLAGS_USE_RCU);
+	mt_init_flags(&mm->mm_mt, MM_MT_FLAGS);
+	mt_set_external_lock(&mm->mm_mt, &mm->mmap_sem);
 #endif
-	mm->vmacache_seqnum = 0;
-	atomic_set(&mm->mm_users, 1);
-	atomic_set(&mm->mm_count, 1);
-	init_rwsem(&mm->mmap_sem);
 	INIT_LIST_HEAD(&mm->mmlist);
 	mm->core_state = NULL;
 	mm_pgtables_bytes_init(mm);
