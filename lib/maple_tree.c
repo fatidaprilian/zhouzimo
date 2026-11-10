@@ -5471,7 +5471,7 @@ static void mt_free_walk(struct rcu_head *head)
 	if (ma_is_leaf(node->type))
 		goto free_leaf;
 
-	mt_init_flags(&mt, node->ma_flags);
+	mt_init_flags(&mt, node->ma_flags & ~MT_FLAGS_LOCK_MASK);
 	mas_lock(&mas);
 	start = node;
 	mas.node = mt_mk_node(node, node->type);
@@ -5540,7 +5540,7 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
 	if (mte_is_leaf(enode))
 		goto free_leaf;
 
-	mt_init_flags(&mt, ma_flags);
+	mt_init_flags(&mt, ma_flags & ~MT_FLAGS_LOCK_MASK);
 	mas_lock(&mas);
 
 	mas.node = start = enode;
