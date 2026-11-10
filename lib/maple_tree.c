@@ -3604,6 +3604,10 @@ static inline int mas_commit_b_node(struct ma_wr_state *wr_mas,
 		return 0;
 
 	node = mas_pop_node(wr_mas->mas);
+	if (unlikely(!node)) {
+		mas_set_err(wr_mas->mas, -ENOMEM);
+		return 0;
+	}
 	node->parent = mas_mn(wr_mas->mas)->parent;
 	wr_mas->mas->node = mt_mk_node(node, b_type);
 	mab_mas_cp(b_node, 0, b_end, wr_mas->mas, false);

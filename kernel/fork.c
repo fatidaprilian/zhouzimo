@@ -470,9 +470,12 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 		goto out;
 
 	/*
-	 * Pre-size the maple tree for the forked address space so the
-	 * per-VMA stores below do not fail partway through the copy.
+	 * Disable RCU temporarily on the child's mm_mt during bulk duplication.
+	 * This allows mas_reuse_node() to reuse preallocated nodes without
+	 * exhausting mas->alloc and triggering a NULL dereference in
+	 * mas_pop_node().
 	 */
+	mt_clear_in_rcu(&mm->mm_mt);
 	retval = mas_expected_entries(&mas, oldmm->map_count);
 	if (retval)
 		goto out;
@@ -577,6 +580,7 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 	/* a new mm has just been created */
 	retval = arch_dup_mmap(oldmm, mm);
 out:
+	mt_set_in_rcu(&mm->mm_mt);
 	mas_destroy(&mas);
 	up_write(&mm->mmap_sem);
 	flush_tlb_mm(oldmm);
