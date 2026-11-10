@@ -991,8 +991,12 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	 * Gap tracking must be enabled: without MT_FLAGS_ALLOC_RANGE,
 	 * mas_update_gap() is a no-op (mt_is_alloc() false) and every
 	 * gap search on a populated tree fails with -ENOMEM.
+	 *
+	 * MT_FLAGS_USE_RCU ensures node destruction is deferred via
+	 * call_rcu() (ma_free_rcu) so concurrent readers in mt_find()
+	 * under rcu_read_lock() never traverse freed memory.
 	 */
-	mt_init_flags(&mm->mm_mt, MT_FLAGS_ALLOC_RANGE);
+	mt_init_flags(&mm->mm_mt, MT_FLAGS_ALLOC_RANGE | MT_FLAGS_USE_RCU);
 #endif
 	mm->vmacache_seqnum = 0;
 	atomic_set(&mm->mm_users, 1);

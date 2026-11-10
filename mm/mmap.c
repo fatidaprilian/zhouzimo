@@ -1950,13 +1950,15 @@ find_vma_prev(struct mm_struct *mm, unsigned long addr,
 			struct vm_area_struct **pprev)
 {
 	struct vm_area_struct *vma;
-	MA_STATE(mas, &mm->mm_mt, addr, addr);
 
 	lockdep_assert_held(&mm->mmap_sem);
-	vma = mas_walk(&mas);
-	*pprev = mas_prev(&mas, 0);
-	if (!vma)
-		vma = mas_next(&mas, ULONG_MAX);
+	vma = find_vma(mm, addr);
+	if (vma) {
+		*pprev = vma->vm_prev;
+	} else {
+		MA_STATE(mas, &mm->mm_mt, ULONG_MAX, ULONG_MAX);
+		*pprev = mas_prev(&mas, 0);
+	}
 	return vma;
 }
 
@@ -2075,9 +2077,6 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
 					error = -ENOMEM;
 			}
 			if (!error) {
-				MA_STATE(mas_del, &mm->mm_mt,
-					 vma->vm_start, vma->vm_start);
-				mas_erase(&mas_del);
 				/*
 				 * We only hold a shared mmap_sem lock here,
 				 * so we need to protect against concurrent
@@ -2086,7 +2085,8 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
 				 * we don't guarantee that all growable vmas
 				 * in a mm share the same root anon vma.
 				 * So, we reuse mm->page_table_lock to guard
-				 * against concurrent vma expansions.
+				 * against concurrent vma expansions and
+				 * serialize mm_mt updates.
 				 */
 				spin_lock(&mm->page_table_lock);
 				if (vma->vm_flags & VM_LOCKED)
@@ -2094,9 +2094,9 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
 				vm_stat_account(mm, vma->vm_flags, grow);
 				anon_vma_interval_tree_pre_update_vma(vma);
 				vma->vm_end = address;
+				vma_mas_store(vma, &mas);
 				anon_vma_interval_tree_post_update_vma(vma);
 				spin_unlock(&mm->page_table_lock);
-				vma_mas_store(vma, &mas);
 
 				perf_event_mmap(vma);
 			}
@@ -2165,9 +2165,6 @@ int expand_downwards(struct vm_area_struct *vma,
 					error = -ENOMEM;
 			}
 			if (!error) {
-				MA_STATE(mas_del, &mm->mm_mt,
-					 vma->vm_start, vma->vm_start);
-				mas_erase(&mas_del);
 				/*
 				 * We only hold a shared mmap_sem lock here,
 				 * so we need to protect against concurrent
@@ -2176,7 +2173,8 @@ int expand_downwards(struct vm_area_struct *vma,
 				 * we don't guarantee that all growable vmas
 				 * in a mm share the same root anon vma.
 				 * So, we reuse mm->page_table_lock to guard
-				 * against concurrent vma expansions.
+				 * against concurrent vma expansions and
+				 * serialize mm_mt updates.
 				 */
 				spin_lock(&mm->page_table_lock);
 				if (vma->vm_flags & VM_LOCKED)
@@ -2185,9 +2183,9 @@ int expand_downwards(struct vm_area_struct *vma,
 				anon_vma_interval_tree_pre_update_vma(vma);
 				vma->vm_start = address;
 				vma->vm_pgoff -= grow;
+				vma_mas_store(vma, &mas);
 				anon_vma_interval_tree_post_update_vma(vma);
 				spin_unlock(&mm->page_table_lock);
-				vma_mas_store(vma, &mas);
 
 				perf_event_mmap(vma);
 			}
