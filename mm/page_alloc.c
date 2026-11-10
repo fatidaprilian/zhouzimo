@@ -336,7 +336,7 @@ int watermark_boost_factor __read_mostly;
 #else
 int watermark_boost_factor __read_mostly = 0;
 #endif
-int watermark_scale_factor = 30;
+int watermark_scale_factor = 200;
 
 /*
  * Extra memory for the system to try freeing. Used to temporarily
@@ -2675,6 +2675,19 @@ __rmqueue_fallback(struct zone *zone, int order, int start_migratetype,
 		 */
 		if (!can_steal && start_migratetype == MIGRATE_MOVABLE
 					&& current_order > order)
+			goto find_smallest;
+
+		/*
+		 * Manual 4.19 adaptation of mainline CMA-fallback limit:
+		 * costly high-order MOVABLE stealing from CMA fragments the
+		 * CMA region. Prefer the smallest CMA page instead of the
+		 * largest to leave large CMA buddies intact for genuine
+		 * MIGRATE_CMA users. struct page only, no folio change.
+		 */
+		if (fallback_mt == MIGRATE_CMA &&
+		    start_migratetype == MIGRATE_MOVABLE &&
+		    order > PAGE_ALLOC_COSTLY_ORDER &&
+		    current_order > order)
 			goto find_smallest;
 
 		goto do_steal;

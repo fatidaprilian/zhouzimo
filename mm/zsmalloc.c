@@ -61,6 +61,7 @@
 #include <linux/preempt.h>
 #include <linux/spinlock.h>
 #include <linux/shrinker.h>
+#include <linux/oom.h>
 #include <linux/types.h>
 #include <linux/debugfs.h>
 #include <linux/zsmalloc.h>
@@ -1549,6 +1550,20 @@ static inline void obj_class_get_and_lock(struct zs_pool *pool, unsigned long ha
 	spin_lock(&(*classp)->lock);
 	/* Re-read under class->lock: PFN is now stable vs migration. */
 	obj = handle_to_obj(handle);
+	/*
+	 * Manual 4.19 adaptation of mainline class-validation fix:
+	 * if the handle was recycled to a different class between the
+	 * lockless read and the locked re-read, hand the lock over to
+	 * the correct class. Uses struct page API only.
+	 */
+	if (pool->size_class[obj_to_class_idx(obj)] != *classp) {
+		struct size_class *new_class =
+			pool->size_class[obj_to_class_idx(obj)];
+		spin_unlock(&(*classp)->lock);
+		*classp = new_class;
+		spin_lock(&(*classp)->lock);
+		obj = handle_to_obj(handle);
+	}
 	obj_to_page(obj, &f_page);
 	*zspagep = get_zspage(f_page);
 	*objp = obj;
@@ -2219,6 +2234,16 @@ static unsigned long zs_shrinker_scan(struct shrinker *shrinker,
 			shrinker);
 
 	/*
+	 * Manual 4.19 adaptation of mainline shrinker-bypass logic:
+	 * critical (OOM_SCORE_ADJ <= -900, see include/linux/oom.h) tasks
+	 * already bypass shrink_slab in mm/vmscan.c, so bypass here as well
+	 * to avoid pool->lock contention on the UI-critical path.
+	 * No lock is held at entry; returning SHRINK_STOP is safe.
+	 */
+	if (task_is_critical())
+		return SHRINK_STOP;
+
+	/*
 	 * Compact classes and calculate compaction delta.
 	 * Can run concurrently with a manually triggered
 	 * (by user) compaction.
@@ -2236,6 +2261,10 @@ static unsigned long zs_shrinker_count(struct shrinker *shrinker,
 	unsigned long pages_to_free = 0;
 	struct zs_pool *pool = container_of(shrinker, struct zs_pool,
 			shrinker);
+
+	/* Paired with zs_shrinker_scan() bypass above. */
+	if (task_is_critical())
+		return 0;
 
 	for (i = ZS_SIZE_CLASSES - 1; i >= 0; i--) {
 		class = pool->size_class[i];
