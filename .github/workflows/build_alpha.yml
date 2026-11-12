@@ -86,7 +86,7 @@ jobs:
         run: |
           echo "=== Setup KernelSU ==="
 
-          curl -LSs https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh | bash -
+          curl -LSs https://raw.githubusercontent.com/re-noroi/KernelSU/noroisu/kernel/setup.sh | bash -s noroisu
 
           echo "=== Verify KernelSU ==="
           grep -R "KernelSU" -n drivers 2>/dev/null | head || true
