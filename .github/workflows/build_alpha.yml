@@ -84,9 +84,49 @@ jobs:
       - name: Setup KernelSU
         working-directory: kernel
         run: |
+          set -euo pipefail
           echo "=== Setup KernelSU ==="
 
-          curl -LSs https://raw.githubusercontent.com/re-noroi/KernelSU/noroisu/kernel/setup.sh | bash -s noroisu
+          curl -LSs https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh | bash -
+
+          echo "=== Patch Extra Manager Support (noroisu) ==="
+          python3 - <<'PY'
+          from pathlib import Path
+
+          tracker = Path("KernelSU/kernel/manager/throne_tracker.c")
+          t_src = tracker.read_text()
+          t_old = (
+              '#define is_midorisu_apk(tgt) extra_manager_apk(tgt, "com.midori.supermanager")\n'
+              '#define test_extra_pkgs(tgt) (is_kowsu_apk(tgt) || is_midorisu_apk(tgt))'
+          )
+          t_new = (
+              '#define is_midorisu_apk(tgt) extra_manager_apk(tgt, "com.midori.supermanager")\n'
+              '#define is_noroisu_apk(tgt) extra_manager_apk(tgt, "com.noroi.supermanager")\n'
+              '#define test_extra_pkgs(tgt) (is_kowsu_apk(tgt) || is_midorisu_apk(tgt) || is_noroisu_apk(tgt))'
+          )
+          assert t_src.count(t_old) == 1, "throne_tracker.c anchor changed"
+          tracker.write_text(t_src.replace(t_old, t_new, 1))
+
+          apk_sign = Path("KernelSU/kernel/manager/apk_sign.c")
+          a_src = apk_sign.read_text()
+          a_old = (
+              '\t// midori01/KernelSU\n'
+              '\tif (check_v2_signature(path, 0x0368, "b9ee6759de4794f954883458b722b97ae6527cb7709a051db9a2348c0eea1e42"))\n'
+              '\t\treturn true;\n\n'
+              '\treturn false;'
+          )
+          a_new = (
+              '\t// midori01/KernelSU\n'
+              '\tif (check_v2_signature(path, 0x0368, "b9ee6759de4794f954883458b722b97ae6527cb7709a051db9a2348c0eea1e42"))\n'
+              '\t\treturn true;\n\n'
+              '\t// re-noroi/KernelSU\n'
+              '\tif (check_v2_signature(path, 0x037c, "cb4c3be2293943b82bd85c77a93c2317d34b99b8dc1b323b75ff8cebb4b2c2ba"))\n'
+              '\t\treturn true;\n\n'
+              '\treturn false;'
+          )
+          assert a_src.count(a_old) == 1, "apk_sign.c anchor changed"
+          apk_sign.write_text(a_src.replace(a_old, a_new, 1))
+          PY
 
           echo "=== Verify KernelSU ==="
           grep -R "KernelSU" -n drivers 2>/dev/null | head || true
@@ -98,6 +138,7 @@ jobs:
           export SUBARCH=arm64
 
           make O=out vendor/munch_defconfig
+          grep -q '^CONFIG_KSU=y$' out/.config
 
           make -j$(nproc) \
             O=out \
