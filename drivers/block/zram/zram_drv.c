@@ -762,7 +762,7 @@ static void read_from_bdev_async(struct zram *zram, struct page *page,
 	struct bio *bio;
 
 	bio = bio_alloc(GFP_NOIO, 1);
-	bio->bi_bdev = zram->bdev;
+	bio_set_dev(bio, zram->bdev);
 	bio->bi_opf = parent->bi_opf;
 	bio->bi_iter.bi_sector = entry * (PAGE_SIZE >> 9);
 	__bio_add_page(bio, page, PAGE_SIZE, 0);
@@ -911,7 +911,7 @@ static ssize_t writeback_store(struct device *dev,
 		zram_slot_unlock(zram, index);
 
 		bio_init(&bio, &bio_vec, 1);
-		bio.bi_bdev = zram->bdev;
+		bio_set_dev(&bio, zram->bdev);
 		bio.bi_opf = REQ_OP_WRITE | REQ_SYNC;
 		bio.bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
 		__bio_add_page(&bio, page, PAGE_SIZE, 0);
@@ -992,7 +992,7 @@ static void zram_sync_read(struct work_struct *work)
 	struct bio bio;
 
 	bio_init(&bio, &bv, 1);
-	bio.bi_bdev = zw->zram->bdev;
+	bio_set_dev(&bio, zw->zram->bdev);
 	bio.bi_opf = REQ_OP_READ;
 	bio.bi_iter.bi_sector = zw->entry * (PAGE_SIZE >> 9);
 	__bio_add_page(&bio, zw->page, PAGE_SIZE, 0);
