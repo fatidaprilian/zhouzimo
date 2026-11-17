@@ -7109,6 +7109,13 @@ int smblib_set_prop_pd_active(struct smb_charger *chg,
 		vote(chg->usb_icl_votable, PD_VOTER, true, USBIN_100MA);
 		vote(chg->usb_icl_votable, USB_PSY_VOTER, false, 0);
 		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, false, 0);
+
+		if (chg->pd_active == POWER_SUPPLY_PD_PPS_ACTIVE) {
+			chg->pd_verifed = true;
+			if (chg->support_ffc && !smblib_get_fastcharge_mode(chg))
+				smblib_set_fastcharge_mode(chg, true);
+		}
+
 		/*set the fcc to PD_UNVERIFED_CURRENT when pd is not verifed*/
 		if (!chg->pd_verifed) {
 			rc = vote(chg->fcc_votable, PD_VERIFED_VOTER,

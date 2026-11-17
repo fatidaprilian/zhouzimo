@@ -1703,9 +1703,6 @@ static int fg_get_property(struct power_supply *psy, enum power_supply_property 
 			break;
 		}
 		val->intval = fg_read_charging_current(bq);
-		if (bq->verify_digest_success == false) {
-			val->intval = min(val->intval, 2000);
-		}
 		val->intval *= 1000;
 		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
@@ -1829,14 +1826,12 @@ static int fg_set_property(struct power_supply *psy,
 		bq->optimiz_soc = val->intval;
 		break;
 	case POWER_SUPPLY_PROP_AUTHENTIC:
-		bq->verify_digest_success = !!val->intval;
+		bq->verify_digest_success = true;
 #ifndef CONFIG_DUAL_FUEL_GAUGE_BQ27Z561
 		if (!bq->fcc_votable)
 			bq->fcc_votable = find_votable("FCC");
-		vote(bq->fcc_votable, BMS_FG_VERIFY, !bq->verify_digest_success,
-				!bq->verify_digest_success ? 2000000 : 0);
-		vote(bq->fcc_votable, BMS_VERIFY_VOTER, !bq->verify_digest_success,
-				!bq->verify_digest_success ? 2000000 : 0);
+		vote(bq->fcc_votable, BMS_FG_VERIFY, false, 0);
+		vote(bq->fcc_votable, BMS_VERIFY_VOTER, false, 0);
 #endif
 		break;
 	case POWER_SUPPLY_PROP_CHIP_OK:
@@ -2944,6 +2939,7 @@ static int bq_fg_probe(struct i2c_client *client,
 	bq->avg_current = -EINVAL;
 	bq->plugout_update_count = 0;
 	bq->shutdown_soc = false;
+	bq->verify_digest_success = true;
 #ifdef CONFIG_DUAL_FUEL_GAUGE_BQ27Z561
 	FG_REPORT_FULL_SOC = FG_REPORT_FULL_SOC_DEVICE;
 #else

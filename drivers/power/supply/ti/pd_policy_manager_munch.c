@@ -2244,15 +2244,10 @@ static void usb_psy_change_work(struct work_struct *work)
 		goto out;
 	}
 
-	if ((pdpm->pd_active < POWER_SUPPLY_PPS_VERIFIED) && (pd_auth_val.intval == 1)
+	if ((pdpm->pd_active < POWER_SUPPLY_PPS_VERIFIED)
 			&& (val.intval == POWER_SUPPLY_PD_PPS_ACTIVE)) {
 		msleep(30);
 		usbpd_pd_contact(pdpm, POWER_SUPPLY_PPS_VERIFIED);
-		if (pdpm->fcc_votable)
-			vote(pdpm->fcc_votable, NON_PPS_PD_FCC_VOTER, false, 0);
-	} else if (!pdpm->pd_active
-			&& (val.intval == POWER_SUPPLY_PD_PPS_ACTIVE)) {
-		usbpd_pps_non_verified_contact(pdpm, POWER_SUPPLY_PPS_NON_VERIFIED);
 		if (pdpm->fcc_votable)
 			vote(pdpm->fcc_votable, NON_PPS_PD_FCC_VOTER, false, 0);
 	} else if (pdpm->pd_active && !val.intval) {
