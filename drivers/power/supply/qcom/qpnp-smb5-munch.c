@@ -1835,7 +1835,11 @@ static int smb5_usb_set_prop(struct power_supply *psy,
 		smblib_rerun_apsd(chg);
 		break;
 	case POWER_SUPPLY_PROP_APDO_MAX:
-		chg->apdo_max = val->intval;
+		if (chg->apdo_max != val->intval) {
+			chg->apdo_max = val->intval;
+			if (chg->usb_psy)
+				power_supply_changed(chg->usb_psy);
+		}
 		break;
 	case POWER_SUPPLY_PROP_FFC_TERMINATION_BBC:
 		smb5_config_iterm(chg, val->intval, 50);

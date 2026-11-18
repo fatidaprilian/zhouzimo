@@ -267,14 +267,14 @@ static int pd_get_batt_capacity(struct usbpd_pm *pdpm, int *capacity)
 
 static void pd_bq_check_ibus_to_enable_dual_bq(struct usbpd_pm *pdpm, int ibus_ma)
 {
-
 	int capacity = 0;
-	if(pdpm->enable_bypass > 0){
-		//pr_debug("%s bypassmode no need to diaable slave and return\n",__func__);
+	int thermal_level = 0;
+
+	if (pdpm->cp.sc8551_charge_mode == SC8551_CHARGE_MODE_BYPASS)
 		return;
-	}
 
 	pd_get_batt_capacity(pdpm, &capacity);
+	pd_get_batt_current_thermal_level(pdpm, &thermal_level);
 	if (ibus_ma <= IBUS_THRESHOLD_MA_FOR_DUAL_BQ_LN8000
 			&& !pdpm->no_need_en_slave_bq
 			&& (pdpm->slave_bq_disabled_check_count < IBUS_THR_TO_CLOSE_SLAVE_COUNT_MAX)) {
@@ -294,6 +294,9 @@ static void pd_bq_check_ibus_to_enable_dual_bq(struct usbpd_pm *pdpm, int ibus_m
 			}
 		}
 	} else if (pdpm->no_need_en_slave_bq && (capacity < CAPACITY_HIGH_THR)
+			&& (thermal_level < MAX_THERMAL_LEVEL_FOR_DUAL_BQ)
+			&& (pdpm->apdo_max_curr > IBUS_MAX_CURRENT_MA)
+			&& (usbpd_get_effective_fcc_val(pdpm) > FCC_MAX_MA_FOR_MASTER_BQ)
 			&& (ibus_ma > (IBUS_THRESHOLD_MA_FOR_DUAL_BQ_LN8000 + IBUS_THR_MA_HYS_FOR_DUAL_BQ))) {
 		if (!pdpm->cp_sec.charge_enabled) {
 			pdpm->no_need_en_slave_bq = false;
@@ -1518,12 +1521,20 @@ reg[%d-%d-%d-%d-%d],step[%d-%d-%d-%d-%d-%d-%d-%d],pmconfig[%d-%d-%d,%d-%d-%d-%d]
 	if (pdpm->cp.bat_therm_fault) { /* battery overheat, stop charge*/
 		pr_debug("bat_therm_fault:%d\n", pdpm->cp.bat_therm_fault);
 		return PM_ALGO_RET_THERM_FAULT;
-	} else if (!pdpm->cp.charge_enabled ||
-		(pm_config.cp_sec_enable && !pdpm->cp_sec.charge_enabled && !pdpm->no_need_en_slave_bq)) {
-		pr_debug("cp.charge_enabled:%d, cp_sec.charge_enabled:%d\n",
-			pdpm->cp.charge_enabled, pdpm->cp_sec.charge_enabled);
+	} else if (!pdpm->cp.charge_enabled) {
+		pr_debug("cp.charge_enabled:%d\n", pdpm->cp.charge_enabled);
 		return PM_ALGO_RET_CHG_DISABLED;
-	} else if (thermal_level >= pdpm->therm_level_threshold || pdpm->is_temp_out_fc2_range) {
+	} else if (pm_config.cp_sec_enable && !pdpm->cp_sec.charge_enabled && !pdpm->no_need_en_slave_bq) {
+		if (pdpm->cp.sc8551_charge_mode == SC8551_CHARGE_MODE_BYPASS) {
+			pr_debug("cp_sec disabled in bypass mode\n");
+			return PM_ALGO_RET_CHG_DISABLED;
+		}
+		/* Slave tripped low-ibus UCP while master is healthy; keep master running */
+		pdpm->no_need_en_slave_bq = true;
+		usbpd_pm_enable_cp_sec(pdpm, false);
+	}
+
+	if (thermal_level >= pdpm->therm_level_threshold || pdpm->is_temp_out_fc2_range) {
 		pr_debug("thermal level too high:%d\n", thermal_level);
 		return PM_ALGO_RET_CHG_DISABLED;
 	} else if (pdpm->cp.bat_ocp_fault || pdpm->cp.bus_ocp_fault
@@ -1579,12 +1590,7 @@ reg[%d-%d-%d-%d-%d],step[%d-%d-%d-%d-%d-%d-%d-%d],pmconfig[%d-%d-%d,%d-%d-%d-%d]
 	 * thermal mitigation*/
 
 	steps = min(sw_ctrl_steps, hw_ctrl_steps);
-
-	if ((curr_ibus_limit < 3100) && (steps > 0)) {
-		pdpm->request_voltage += steps * 5;
-	} else {
-		pdpm->request_voltage += steps * STEP_MV;
-	}
+	pdpm->request_voltage += steps * STEP_MV;
 
 	
 	if (pdpm->cp.sc8551_charge_mode != SC8551_CHARGE_MODE_BYPASS) {
@@ -1753,6 +1759,7 @@ static int usbpd_pm_sm(struct usbpd_pm *pdpm)
 			usbpd_pm_move_state(pdpm, PD_PM_STATE_FC2_EXIT);
 		} else {
 			pdpm->fc2_exit_flag = false;
+			cancel_delayed_work_sync(&pdpm->fc2_exit_work);
 
 			pr_debug("batt_volt-%d is ok, start flash charging\n",
 					pdpm->cp.vbat_volt);
@@ -1865,25 +1872,21 @@ static int usbpd_pm_sm(struct usbpd_pm *pdpm)
 		}
 
 		if (pm_config.cp_sec_enable && !pdpm->cp_sec.charge_enabled) {
-			pd_get_batt_current_thermal_level(pdpm, &thermal_level);
-			pd_get_batt_capacity(pdpm, &capacity);
-			if (pdpm->enable_bypass == 1 || (thermal_level < MAX_THERMAL_LEVEL_FOR_DUAL_BQ
-					&& capacity < CAPACITY_HIGH_THR)) {
+			if (pdpm->cp.sc8551_charge_mode == SC8551_CHARGE_MODE_BYPASS) {
 				pr_debug("%s ENTRY_3 enable_cp_sec\n", __func__);
 				usbpd_pm_enable_cp_sec(pdpm, true);
 				msleep(30);
 				usbpd_pm_check_cp_sec_enabled(pdpm);
-			} else if(pdpm->enable_bypass == 0)
+			} else {
+				/* Stage slave in dynamically via pd_bq_check_ibus_to_enable_dual_bq once ibus > 2.7A */
 				pdpm->no_need_en_slave_bq = true;
+			}
 		}
 #else
 		if (pm_config.cp_sec_enable && !pdpm->cp_sec.charge_enabled) {
-			pd_get_batt_current_thermal_level(pdpm, &thermal_level);
-			pd_get_batt_capacity(pdpm, &capacity);
-			if (pdpm->enable_bypass == 1 || (thermal_level < MAX_THERMAL_LEVEL_FOR_DUAL_BQ
-					&& capacity < CAPACITY_HIGH_THR))
+			if (pdpm->cp.sc8551_charge_mode == SC8551_CHARGE_MODE_BYPASS)
 				usbpd_pm_enable_cp_sec(pdpm, true);
-			else if(pdpm->enable_bypass == 0)
+			else
 				pdpm->no_need_en_slave_bq = true;
 		}
 
@@ -2123,6 +2126,8 @@ static void usbpd_pm_disconnect(struct usbpd_pm *pdpm)
 	}
 
 	cancel_delayed_work_sync(&pdpm->pm_work);
+	pdpm->fc2_exit_flag = false;
+	cancel_delayed_work_sync(&pdpm->fc2_exit_work);
 
 
 #if defined(CONFIG_BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH)
@@ -2140,11 +2145,14 @@ static void usbpd_pm_disconnect(struct usbpd_pm *pdpm)
 		vote(pdpm->fcc_votable, BQ_TAPER_CELL_HGIH_FCC_VOTER,
 				false, 0);
 	}
+	ibus_upgrade = 0;
+	ibus_upgrade_bypass = 0;
+	last_curr_ibus_limit = 0;
+	last_curr_ibus_limit_bypass = 0;
 	pdpm->pps_supported = false;
 	pdpm->jeita_triggered = false;
 	pdpm->is_temp_out_fc2_range = false;
 	pdpm->no_need_en_slave_bq = false;
-	pdpm->fc2_exit_flag = false;
 	pdpm->apdo_selected_pdo = 0;
 	pdpm->over_cell_vol_high_count = 0;
 	pdpm->slave_bq_disabled_check_count = 0;
@@ -2250,6 +2258,9 @@ static void usb_psy_change_work(struct work_struct *work)
 		usbpd_pd_contact(pdpm, POWER_SUPPLY_PPS_VERIFIED);
 		if (pdpm->fcc_votable)
 			vote(pdpm->fcc_votable, NON_PPS_PD_FCC_VOTER, false, 0);
+	} else if ((pdpm->pd_active == POWER_SUPPLY_PPS_VERIFIED)
+			&& (val.intval == POWER_SUPPLY_PD_PPS_ACTIVE)) {
+		usbpd_pm_evaluate_src_caps(pdpm);
 	} else if (pdpm->pd_active && !val.intval) {
 		usbpd_pd_contact(pdpm, POWER_SUPPLY_PPS_INACTIVE);
 		if (pdpm->fcc_votable)
