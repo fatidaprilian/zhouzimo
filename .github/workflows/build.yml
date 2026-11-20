@@ -151,6 +151,10 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
 
+          echo "KERNEL_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "KERNEL_SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "KERNEL_RELEASE=$(cat out/include/config/kernel.release)" >> $GITHUB_ENV
+
       - name: Clone AnyKernel3
         run: |
           git clone --depth=1 \
@@ -201,4 +205,144 @@ jobs:
           files: ${{ env.ZIP_NAME }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send to Telegram
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+        run: |
+          set -euo pipefail
+          set +x
+
+          if [[ -z "${TG_BOT_TOKEN}" || -z "${TG_CHAT_ID}" ]]; then
+            echo "::warning::TG_BOT_TOKEN or TG_CHAT_ID secret is not set; skipping Telegram upload."
+            exit 0
+          fi
+
+          if [[ ! -f "${ZIP_NAME}" ]]; then
+            echo "::error::Flashable zip not found: ${ZIP_NAME}"
+            exit 1
+          fi
+
+          python3 - <<'PY' > /tmp/tg_caption.html
+          import html
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ.get("GITHUB_TOKEN", "")
+          branch = os.environ.get("KERNEL_BRANCH", "zhouzimo")
+          release_tag = os.environ["RELEASE_TAG"]
+          kernel_sha = os.environ["KERNEL_SHA"]
+          short_sha = os.environ["KERNEL_SHORT_SHA"]
+          kernel_release = os.environ.get("KERNEL_RELEASE", "unknown")
+
+          def gh_get(path):
+              req = urllib.request.Request(
+                  f"https://api.github.com{path}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "User-Agent": "zhouzimo-ci",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      return json.loads(resp.read().decode("utf-8"))
+              except (urllib.error.URLError, TimeoutError, ValueError):
+                  return None
+
+          prev_tag = None
+          releases = gh_get(f"/repos/{repo}/releases?per_page=10") or []
+          for rel in releases:
+              tag = rel.get("tag_name")
+              if tag and tag != release_tag:
+                  prev_tag = tag
+                  break
+
+          subjects = []
+          heading = "Recent commits:"
+          if prev_tag:
+              q_prev = urllib.parse.quote(prev_tag, safe="")
+              cmp_data = gh_get(f"/repos/{repo}/compare/{q_prev}...{kernel_sha}")
+              if cmp_data and cmp_data.get("commits"):
+                  subjects = [
+                      c["commit"]["message"].splitlines()[0].strip()
+                      for c in cmp_data["commits"]
+                      if c.get("commit", {}).get("message")
+                  ]
+                  subjects.reverse()
+                  heading = f"Changelog (since {prev_tag}):"
+
+          if not subjects:
+              commits = gh_get(f"/repos/{repo}/commits?sha={kernel_sha}&per_page=10") or []
+              subjects = [
+                  c["commit"]["message"].splitlines()[0].strip()
+                  for c in commits
+                  if c.get("commit", {}).get("message")
+              ]
+
+          e = html.escape
+          header_plain = [
+              "Zhouzimo Kernel - Poco F4 (munch)",
+              f"Kernel: {kernel_release}",
+              f"Branch: {branch} | Build: {release_tag}",
+              f"Commit: {short_sha}",
+              "",
+              heading,
+          ]
+          header_html = [
+              "<b>Zhouzimo Kernel - Poco F4 (munch)</b>",
+              f"<b>Kernel:</b> <code>{e(kernel_release)}</code>",
+              f"<b>Branch:</b> <code>{e(branch)}</code> | <b>Build:</b> <code>{e(release_tag)}</code>",
+              f"<b>Commit:</b> <code>{e(short_sha)}</code>",
+              "",
+              f"<b>{e(heading)}</b>",
+          ]
+
+          rel_url = f"https://github.com/{repo}/releases/tag/{urllib.parse.quote(release_tag, safe='')}"
+          footer_plain = "GitHub Release"
+          footer_html = f'<a href="{e(rel_url, quote=True)}">GitHub Release</a>'
+          if prev_tag:
+              diff_url = f"https://github.com/{repo}/compare/{urllib.parse.quote(prev_tag, safe='')}...{urllib.parse.quote(release_tag, safe='')}"
+              footer_plain += " | Full Diff"
+              footer_html += f' | <a href="{e(diff_url, quote=True)}">Full Diff</a>'
+
+          # Telegram sendDocument caption limit is 1024 parsed characters; reserve margin for overflow line
+          max_plain = 940
+          used = sum(len(line) + 1 for line in header_plain) + len(footer_plain) + 2
+          body_html = []
+          shown = 0
+          for subj in subjects[:15]:
+              clipped = subj if len(subj) <= 88 else subj[:85] + "..."
+              line_plain = f"• {clipped}"
+              if used + len(line_plain) + 1 > max_plain:
+                  break
+              body_html.append(f"• {e(clipped)}")
+              used += len(line_plain) + 1
+              shown += 1
+
+          remaining = len(subjects) - shown
+          if not body_html:
+              body_html.append("• No new commits recorded")
+          elif remaining > 0:
+              body_html.append(f"• <i>...and {remaining} more commits</i>")
+
+          print("\n".join(header_html + body_html + ["", footer_html]))
+          PY
+
+          resp=$(printf 'url = "https://api.telegram.org/bot%s/sendDocument"\n' "${TG_BOT_TOKEN}" | \
+            curl -sS --max-time 180 -K - \
+              -F "chat_id=${TG_CHAT_ID}" \
+              -F "parse_mode=HTML" \
+              -F "caption=</tmp/tg_caption.html" \
+              -F "document=@${ZIP_NAME}")
+
+          python3 -c 'import json, sys; d = json.loads(sys.argv[1]); ok = d.get("ok", False); print("Telegram upload OK" if ok else f"Telegram upload failed: {d.get(\"description\", \"unknown error\")}"); sys.exit(0 if ok else 1)' "$resp"
           
