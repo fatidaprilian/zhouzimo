@@ -8309,8 +8309,8 @@ static u64 cpu_uclamp_ls_read_u64(struct cgroup_subsys_state *css,
 #ifdef CONFIG_UCLAMP_ASSIST
 struct uclamp_param {
 	char *name;
-	char uclamp_min[3];
-	char uclamp_max[3];
+	char uclamp_min[8];
+	char uclamp_max[8];
 	u64  uclamp_latency_sensitive;
 	u64  cpu_shares;
 	s64  cpu_quota_us;	/* <0 = unlimited */
@@ -8341,7 +8341,7 @@ static void uclamp_set(struct cgroup_subsys_state *css)
 	 * avoid.  < 0 leaves the group unlimited.
 	 */
 	static struct uclamp_param tgts[] = {
-		{"top-app",             "20", "max", 1, 20480,	-1},
+		{"top-app",             "5",  "max", 1, 20480,	-1},
 		{"rt",			"0", "max", 0, 20480,	-1},
 		{"nnapi-hal",		"0", "max", 0, 20480,	-1},
 		{"foreground",          "0",  "80",  0, 12288,	-1},
