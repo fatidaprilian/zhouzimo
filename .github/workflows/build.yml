@@ -136,6 +136,8 @@ jobs:
         run: |
           export ARCH=arm64
           export SUBARCH=arm64
+          export KBUILD_BUILD_USER=zhouzimo
+          export KBUILD_BUILD_HOST=munch
 
           make O=out vendor/munch_defconfig
           grep -q '^CONFIG_KSU=y$' out/.config
@@ -163,6 +165,8 @@ jobs:
           cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/${TARGET}-dtbo.img
 
           sed -i "s/devicename=.*/devicename=munch/" AnyKernel3/anykernel.sh
+          sed -i 's|^kernel.string=.*|kernel.string=\\\\ Zhouzimo Kernel (E404R Base) \\\\|' AnyKernel3/anykernel.sh
+          sed -i 's| E404R Kernel @ Project113 | Zhouzimo Kernel (Based on E404R @ Project113) |' AnyKernel3/anykernel.sh
 
           cd AnyKernel3
 
