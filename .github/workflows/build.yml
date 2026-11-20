@@ -344,5 +344,5 @@ jobs:
               -F "caption=</tmp/tg_caption.html" \
               -F "document=@${ZIP_NAME}")
 
-          python3 -c 'import json, sys; d = json.loads(sys.argv[1]); ok = d.get("ok", False); print("Telegram upload OK" if ok else f"Telegram upload failed: {d.get(\"description\", \"unknown error\")}"); sys.exit(0 if ok else 1)' "$resp"
+          python3 -c 'import json, sys; d = json.loads(sys.argv[1]); ok = d.get("ok", False); desc = d.get("description", "unknown error"); print("Telegram upload OK" if ok else f"Telegram upload failed: {desc}"); sys.exit(0 if ok else 1)' "$resp"
           
