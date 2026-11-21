@@ -62,6 +62,27 @@ static void cluster_prepare(struct lpm_cluster *cluster,
 static bool print_parsed_dt;
 module_param_named(print_parsed_dt, print_parsed_dt, bool, 0664);
 
+#define LPM_TEO_DECAY_SHIFT	3
+#define LPM_TEO_PULSE		1024
+
+struct lpm_teo_bin {
+	u64 hits;
+	u64 misses;
+};
+
+struct lpm_teo_cpu {
+	u64 sleep_length_us;
+	int last_idx;
+	bool needs_update;
+	bool tick_wakeup;
+	struct lpm_teo_bin bins[NR_LPM_LEVELS];
+};
+
+static DEFINE_PER_CPU(struct lpm_teo_cpu, lpm_teo_cpus);
+
+static bool rail_pc_idle_enabled = true;
+module_param(rail_pc_idle_enabled, bool, 0644);
+
 /**
  * msm_cpuidle_get_deep_idle_latency - Get deep idle latency value
  *
@@ -450,24 +471,161 @@ static int psci_enter_sleep(struct lpm_cpu *cpu, int idx, bool from_idle)
 	return ret;
 }
 
+static void lpm_teo_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
+{
+	struct lpm_teo_cpu *cpu_data = this_cpu_ptr(&lpm_teo_cpus);
+	int count = min_t(int, drv->state_count, NR_LPM_LEVELS);
+	int last_idx = cpu_data->last_idx;
+	int i, idx_timer = 0, idx_hit = 0;
+	u64 measured_us;
+
+	if (cpu_data->tick_wakeup && cpu_data->sleep_length_us > TICK_USEC) {
+		measured_us = cpu_data->sleep_length_us;
+	} else {
+		measured_us = dev->last_residency > 0 ? (u64)dev->last_residency : 0;
+		if (last_idx > 0 && last_idx < count &&
+		    measured_us > drv->states[last_idx].exit_latency)
+			measured_us -= drv->states[last_idx].exit_latency / 2;
+	}
+
+	for (i = 0; i < count; i++) {
+		struct lpm_teo_bin *bin = &cpu_data->bins[i];
+		u64 residency = drv->states[i].target_residency;
+
+		bin->hits -= bin->hits >> LPM_TEO_DECAY_SHIFT;
+		bin->misses -= bin->misses >> LPM_TEO_DECAY_SHIFT;
+
+		if (residency <= cpu_data->sleep_length_us)
+			idx_timer = i;
+		if (residency <= measured_us)
+			idx_hit = i;
+	}
+
+	if (idx_hit < idx_timer)
+		cpu_data->bins[idx_timer].misses += LPM_TEO_PULSE;
+	else
+		cpu_data->bins[idx_timer].hits += LPM_TEO_PULSE;
+}
+
 static int lpm_cpuidle_select(struct cpuidle_driver *drv,
 		struct cpuidle_device *dev, bool *stop_tick)
 {
-#ifdef CONFIG_NO_HZ_COMMON
-	ktime_t delta_next;
-	s64 duration_ns = tick_nohz_get_sleep_length(&delta_next);
+	struct lpm_teo_cpu *cpu_data = this_cpu_ptr(&lpm_teo_cpus);
+	int count = min_t(int, drv->state_count, NR_LPM_LEVELS);
+	int latency_req = cpuidle_governor_latency_req(dev->cpu);
+	s64 duration_ns = TICK_NSEC;
+	u64 duration_us;
+	int i, idx = 0;
 
-	if (duration_ns <= TICK_NSEC)
+	if (cpu_data->needs_update) {
+		lpm_teo_update(drv, dev);
+		cpu_data->needs_update = false;
+	}
+
+#ifdef CONFIG_NO_HZ_COMMON
+	{
+		ktime_t delta_next;
+
+		duration_ns = tick_nohz_get_sleep_length(&delta_next);
+	}
+#endif
+	duration_us = duration_ns > 0 ?
+		      (u64)ktime_to_us(ns_to_ktime(duration_ns)) : 0;
+	cpu_data->sleep_length_us = duration_us;
+
+	if (!rail_pc_idle_enabled || suspend_in_progress || latency_req <= 0)
+		goto out_tick;
+
+	for (i = 1; i < count; i++) {
+		struct cpuidle_state *s = &drv->states[i];
+
+		if (s->disabled || dev->states_usage[i].disable ||
+		    !lpm_cpu_mode_allow(dev->cpu, i, true))
+			continue;
+
+		if (s->exit_latency > (unsigned int)latency_req ||
+		    s->target_residency > duration_us)
+			break;
+
+		idx = i;
+	}
+
+	if (idx > 0) {
+		u64 hits = 0, misses = 0;
+
+		for (i = idx; i < count; i++) {
+			hits += cpu_data->bins[i].hits;
+			misses += cpu_data->bins[i].misses;
+		}
+
+		if (misses > hits)
+			idx = 0;
+	}
+
+out_tick:
+#ifdef CONFIG_NO_HZ_COMMON
+	if (idx == 0 && !tick_nohz_tick_stopped() &&
+	    (duration_ns <= TICK_NSEC ||
+	     (rail_pc_idle_enabled && !suspend_in_progress)))
 		*stop_tick = false;
 #endif
 
+	return idx;
+}
+
+static void lpm_cpuidle_reflect(struct cpuidle_device *dev, int index)
+{
+	struct lpm_teo_cpu *cpu_data = this_cpu_ptr(&lpm_teo_cpus);
+
+	cpu_data->last_idx = index;
+	cpu_data->needs_update = true;
+	cpu_data->tick_wakeup = tick_nohz_idle_got_tick();
+}
+
+static int lpm_cpuidle_enable_device(struct cpuidle_driver *drv,
+		struct cpuidle_device *dev)
+{
+	memset(&per_cpu(lpm_teo_cpus, dev->cpu), 0,
+	       sizeof(struct lpm_teo_cpu));
 	return 0;
 }
 
 static int lpm_cpuidle_enter(struct cpuidle_device *dev,
 		struct cpuidle_driver *drv, int idx)
 {
-	wfi();
+	struct lpm_cpu *cpu = per_cpu(cpu_lpm, dev->cpu);
+	int state_id, ret;
+
+	if (idx <= 0 || !cpu || idx >= cpu->nlevels) {
+		wfi();
+		return 0;
+	}
+
+	if (need_resched())
+		return -1;
+
+	if (cpu->levels[idx].is_reset && cpu_pm_enter()) {
+		wfi();
+		return 0;
+	}
+
+	/*
+	 * Enter per-core PSCI power collapse without cluster_prepare() so
+	 * screen-on idle never escalates into L3 llcc-off (6.56 ms exit)
+	 * or contends on cluster->sync_lock across all 8 cores.
+	 */
+	state_id = PSCI_POWER_STATE(cpu->levels[idx].is_reset) +
+		   cpu->levels[idx].psci_id;
+	ret = arm_cpuidle_suspend(state_id);
+
+	if (cpu->levels[idx].is_reset)
+		cpu_pm_exit();
+
+	if (ret) {
+		wfi();
+		return 0;
+	}
+
 	return idx;
 }
 
@@ -543,7 +701,9 @@ static int cpuidle_register_cpu(struct cpuidle_driver *drv,
 static struct cpuidle_governor lpm_governor = {
 	.name =		"qcom",
 	.rating =	30,
+	.enable =	lpm_cpuidle_enable_device,
 	.select =	lpm_cpuidle_select,
+	.reflect =	lpm_cpuidle_reflect,
 };
 
 static int cluster_cpuidle_register(struct lpm_cluster *cl)
@@ -578,9 +738,10 @@ static int cluster_cpuidle_register(struct lpm_cluster *cl)
 			snprintf(st->name, CPUIDLE_NAME_LEN, "C%u\n", i);
 			strlcpy(st->desc, cpu_level->name, CPUIDLE_DESC_LEN);
 
-			st->flags = 0;
+			st->flags = cpu_level->use_bc_timer ?
+				    CPUIDLE_FLAG_TIMER_STOP : 0;
 			st->exit_latency = cpu_level->pwr.exit_latency;
-			st->target_residency = 0;
+			st->target_residency = cpu_level->pwr.min_residency;
 			st->enter = lpm_cpuidle_enter;
 			if (i == lpm_cpu->nlevels - 1)
 				st->enter_s2idle = lpm_cpuidle_s2idle;
