@@ -409,10 +409,17 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 
 		scm_data[0] = level;
 		scm_data[1] = priv->bin.total_time;
-		if (refresh_rate >= 120) {
-			scm_data[2] = priv->bin.busy_time + (priv->bin.busy_time >> 1);
-		} else if (refresh_rate == 90) {
+		/*
+		 * Gate high-refresh busy_time boost on >= 25% actual load so
+		 * idle/light 120Hz UI does not inflate GPU OPP; heavy bursts
+		 * still hit the CEILING fast-path above.
+		 */
+		if (refresh_rate >= 120 &&
+		    priv->bin.busy_time >= (priv->bin.total_time >> 2)) {
 			scm_data[2] = priv->bin.busy_time + (priv->bin.busy_time >> 2);
+		} else if (refresh_rate == 90 &&
+			   priv->bin.busy_time >= (priv->bin.total_time >> 2)) {
+			scm_data[2] = priv->bin.busy_time + (priv->bin.busy_time >> 3);
 		} else {
 			scm_data[2] = priv->bin.busy_time;
 		}
