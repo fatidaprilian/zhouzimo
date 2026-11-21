@@ -1,6 +1,15 @@
 #ifdef CONFIG_SMP
 #include "sched-pelt.h"
 
+/*
+ * Gate EAS PELT fast-ramp behind a runtime sysctl (off by default to curb
+ * idle/light-load OPP spikes and power draw; toggle via sched_pelt_multiplier).
+ */
+DECLARE_STATIC_KEY_FALSE(sched_pelt_multiplier);
+
+#define sched_pelt_multiplier_enabled() \
+	static_branch_unlikely(&sched_pelt_multiplier)
+
 int __update_load_avg_blocked_se(u64 now, struct sched_entity *se);
 int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se);
 int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq);

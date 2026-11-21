@@ -100,6 +100,29 @@ int __weak arch_asym_cpu_priority(int cpu)
  */
 #define fits_capacity(cap, max)	((cap) * 1280 < (max) * 1024)
 
+DEFINE_STATIC_KEY_FALSE(sched_pelt_multiplier);
+int sysctl_sched_pelt_multiplier;
+
+int sched_pelt_multiplier_handler(struct ctl_table *table, int write,
+		void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+
+	if (write && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	if (sysctl_sched_pelt_multiplier)
+		static_branch_enable(&sched_pelt_multiplier);
+	else
+		static_branch_disable(&sched_pelt_multiplier);
+
+	return 0;
+}
+
 #endif
 
 #ifdef CONFIG_CFS_BANDWIDTH
@@ -4553,6 +4576,8 @@ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
 		detach_entity_load_avg(cfs_rq, se);
 		update_tg_load_avg(cfs_rq, 0);
 	} else if (decayed) {
+		if (!sched_pelt_multiplier_enabled())
+			cfs_rq_util_change(cfs_rq, 0);
 		if (flags & UPDATE_TG)
 			update_tg_load_avg(cfs_rq, 0);
 	}
@@ -4560,7 +4585,8 @@ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
 	if (flags & UPDATE_UTIL_EST)
 		util_est_update(se);
 
-	cfs_rq_util_change(cfs_rq, 0);
+	if (sched_pelt_multiplier_enabled())
+		cfs_rq_util_change(cfs_rq, 0);
 }
 
 /*
