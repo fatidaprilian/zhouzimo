@@ -5476,7 +5476,7 @@ static void __setscheduler_params(struct task_struct *p,
 		__setparam_dl(p, attr);
 	} else if (fair_policy(policy)) {
 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
-			if (attr->sched_runtime) {
+		if (attr->sched_runtime) {
 			p->se.custom_slice = 1;
 			p->se.slice = clamp_t(u64, attr->sched_runtime,
 					      NSEC_PER_MSEC/10,   /* HZ=1000 * 10 */
@@ -7577,7 +7577,7 @@ void __init sched_init(void)
 	}
 
 	set_load_weight(&init_task, false);
-	init_task.se.slice = sysctl_sched_base_slice,
+	init_task.se.slice = sysctl_sched_base_slice;
 
 	/*
 	 * The boot idle thread does lazy MMU switching as well:
