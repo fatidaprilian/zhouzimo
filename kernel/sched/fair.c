@@ -5040,8 +5040,18 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		 *   vl_i = (W + w_i)*vl'_i / W
 		 *        = (W*vl'_i + w_i*vl'_i) / W
 		 *        = vl'_i + w_i*vl'_i/W
+		 *
+		 * Guard the residual w_i*vl'_i with divide-first fallback on s64 overflow.
 		 */
-		lag += div64_long(lag * weight, load);
+		{
+			s64 delta;
+
+			if (check_mul_overflow(lag, (s64)weight, &delta))
+				delta = div64_long(lag, load) * (s64)weight;
+			else
+				delta = div64_long(delta, load);
+			lag += delta;
+		}
 
 		/*
 		 * A heavy entity (relative to the tree) will pull the
@@ -5388,6 +5398,12 @@ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq, bool protect)
 {
 	struct sched_entity *se = pick_eevdf(cfs_rq, protect);
 
+	/* Guard against NULL return if rounding leaves no eligible entity. */
+	if (unlikely(!se)) {
+		SCHED_WARN_ON(1);
+		return NULL;
+	}
+
 	if (se->sched_delayed) {
 		dequeue_entities(rq, se, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
 		/*
@@ -5436,6 +5452,9 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 	 */
 	update_load_avg(cfs_rq, curr, UPDATE_TG);
 	update_cfs_group(curr);
+
+	/* Advance zero_vruntime on long-running runqueues to bound entity_key(). */
+	avg_vruntime(cfs_rq);
 
 #ifdef CONFIG_SCHED_HRTICK
 	/*
@@ -8889,8 +8908,11 @@ pick:
 	 * Because p is enqueued, nse being null can only mean that we
 	 * dequeued a delayed task. If there are still entities queued in
 	 * cfs, check if the next one will be p.
+	 *
+	 * With DELAY_DEQUEUE off, NULL means no eligible entity; do not spin
+	 * while holding rq->lock.
 	 */
-	if (!nse && cfs_rq->nr_queued)
+	if (!nse && sched_feat(DELAY_DEQUEUE) && cfs_rq->nr_queued)
 		goto pick;
 
 	/*
@@ -8937,8 +8959,12 @@ again:
 		throttled |= check_cfs_rq_runtime(cfs_rq);
 
 		se = pick_next_entity(rq, cfs_rq, true);
-		if (!se)
-			goto again;
+		/* Bound retry to delayed dequeues; NULL otherwise means no eligible entity. */
+		if (!se) {
+			if (sched_feat(DELAY_DEQUEUE))
+				goto again;
+			return NULL;
+		}
 		cfs_rq = group_cfs_rq(se);
 	} while (cfs_rq);
 
