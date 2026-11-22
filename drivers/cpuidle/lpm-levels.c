@@ -29,6 +29,8 @@
 #include <linux/cpuhotplug.h>
 #include <linux/regulator/machine.h>
 #include <linux/sched/clock.h>
+#include <linux/sched/topology.h>
+#include <linux/input.h>
 #include <soc/qcom/pm.h>
 #include <soc/qcom/event_timer.h>
 #include <soc/qcom/lpm_levels.h>
@@ -82,6 +84,150 @@ static DEFINE_PER_CPU(struct lpm_teo_cpu, lpm_teo_cpus);
 
 static bool rail_pc_idle_enabled = true;
 module_param(rail_pc_idle_enabled, bool, 0644);
+
+/*
+ * Percentage of CPU capacity above which TEO keeps the core in WFI
+ * instead of entering rail-pc (Linux 6.3+ util-awareness adapted for
+ * 2-state SM8250 cores). 0 disables util-awareness for A/B testing.
+ */
+static unsigned int teo_util_pct = 25;
+module_param(teo_util_pct, uint, 0644);
+
+static bool lpm_teo_cpu_utilized(int cpu)
+{
+#ifdef CONFIG_SMP
+	unsigned int pct = READ_ONCE(teo_util_pct);
+	unsigned long cap;
+
+	if (!pct)
+		return false;
+	if (pct >= 100)
+		return true;
+
+	cap = arch_scale_cpu_capacity(cpu);
+	if (!cap)
+		return false;
+
+	return sched_cpu_util(cpu) >= (cap * pct) / 100;
+#else
+	return false;
+#endif
+}
+
+/*
+ * Screen-on cluster/llcc-off idle (exit 6.56 ms, min-residency 9.99 ms).
+ * Default ON; gated by 750 ms input holdoff, PM QoS, >= 20 ms cluster
+ * sleep margin, and RPMh sleep_allowed(). Runtime toggleable via sysfs.
+ */
+static bool cluster_idle_enabled = true;
+module_param(cluster_idle_enabled, bool, 0644);
+
+static unsigned int cluster_idle_min_sleep_us = 20000;
+module_param(cluster_idle_min_sleep_us, uint, 0644);
+
+static unsigned int cluster_input_holdoff_ms = 750;
+module_param(cluster_input_holdoff_ms, uint, 0644);
+
+static atomic64_t lpm_last_input_ns = ATOMIC64_INIT(0);
+
+static bool lpm_cluster_input_active(void)
+{
+	unsigned int holdoff_ms = READ_ONCE(cluster_input_holdoff_ms);
+	s64 last_ns;
+
+	if (!holdoff_ms)
+		return false;
+
+	last_ns = atomic64_read(&lpm_last_input_ns);
+	if (!last_ns)
+		return false;
+
+	return (ktime_get_mono_fast_ns() - last_ns) <
+	       (s64)holdoff_ms * NSEC_PER_MSEC;
+}
+
+#ifdef CONFIG_INPUT
+static bool lpm_input_registered;
+
+static void lpm_input_event(struct input_handle *handle,
+			    unsigned int type, unsigned int code, int value)
+{
+	if (type == EV_SYN)
+		return;
+
+	atomic64_set(&lpm_last_input_ns, ktime_get_mono_fast_ns());
+}
+
+static int lpm_input_connect(struct input_handler *handler,
+			     struct input_dev *dev,
+			     const struct input_device_id *id)
+{
+	struct input_handle *handle;
+	int ret;
+
+	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+	if (!handle)
+		return -ENOMEM;
+
+	handle->dev = dev;
+	handle->handler = handler;
+	handle->name = "lpm_cluster_idle";
+
+	ret = input_register_handle(handle);
+	if (ret)
+		goto free_handle;
+
+	ret = input_open_device(handle);
+	if (ret)
+		goto unregister_handle;
+
+	return 0;
+
+unregister_handle:
+	input_unregister_handle(handle);
+free_handle:
+	kfree(handle);
+	return ret;
+}
+
+static void lpm_input_disconnect(struct input_handle *handle)
+{
+	input_close_device(handle);
+	input_unregister_handle(handle);
+	kfree(handle);
+}
+
+static const struct input_device_id lpm_input_ids[] = {
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
+			 INPUT_DEVICE_ID_MATCH_ABSBIT,
+		.evbit = { BIT_MASK(EV_ABS) },
+		.absbit = { [BIT_WORD(ABS_MT_POSITION_X)] =
+			BIT_MASK(ABS_MT_POSITION_X) |
+			BIT_MASK(ABS_MT_POSITION_Y) }
+	},
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_KEYBIT |
+			 INPUT_DEVICE_ID_MATCH_ABSBIT,
+		.keybit = { [BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH) },
+		.absbit = { [BIT_WORD(ABS_X)] =
+			BIT_MASK(ABS_X) | BIT_MASK(ABS_Y) }
+	},
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT,
+		.evbit = { BIT_MASK(EV_KEY) }
+	},
+	{ }
+};
+
+static struct input_handler lpm_input_handler = {
+	.event		= lpm_input_event,
+	.connect	= lpm_input_connect,
+	.disconnect	= lpm_input_disconnect,
+	.name		= "lpm_cluster_idle_handler",
+	.id_table	= lpm_input_ids,
+};
+#endif
 
 /**
  * msm_cpuidle_get_deep_idle_latency - Get deep idle latency value
@@ -176,12 +322,12 @@ static int cluster_select(struct lpm_cluster *cluster, bool from_idle)
 	int i;
 	struct cpumask mask;
 	uint32_t latency_us = ~0U;
-	uint32_t sleep_us;
+	uint64_t sleep_us;
 
 	if (!cluster)
 		return -EINVAL;
 
-	sleep_us = (uint32_t)get_cluster_sleep_time(cluster, from_idle);
+	sleep_us = get_cluster_sleep_time(cluster, from_idle);
 
 	if (cpumask_and(&mask, cpu_online_mask, &cluster->child_cpus))
 		latency_us = pm_qos_request_for_cpumask(PM_QOS_CPU_DMA_LATENCY,
@@ -209,6 +355,10 @@ static int cluster_select(struct lpm_cluster *cluster, bool from_idle)
 			continue;
 
 		if (level->notify_rpm) {
+			if (from_idle &&
+			    (sleep_us < READ_ONCE(cluster_idle_min_sleep_us) ||
+			     lpm_cluster_input_active()))
+				continue;
 			if (!(sys_pm_ops && sys_pm_ops->sleep_allowed))
 				continue;
 			if (!sys_pm_ops->sleep_allowed())
@@ -533,7 +683,8 @@ static int lpm_cpuidle_select(struct cpuidle_driver *drv,
 		      (u64)ktime_to_us(ns_to_ktime(duration_ns)) : 0;
 	cpu_data->sleep_length_us = duration_us;
 
-	if (!rail_pc_idle_enabled || suspend_in_progress || latency_req <= 0)
+	if (!rail_pc_idle_enabled || suspend_in_progress || latency_req <= 0 ||
+	    lpm_teo_cpu_utilized(dev->cpu))
 		goto out_tick;
 
 	for (i = 1; i < count; i++) {
@@ -594,7 +745,9 @@ static int lpm_cpuidle_enter(struct cpuidle_device *dev,
 		struct cpuidle_driver *drv, int idx)
 {
 	struct lpm_cpu *cpu = per_cpu(cpu_lpm, dev->cpu);
-	int state_id, ret;
+	const struct cpumask *cpumask = get_cpu_mask(dev->cpu);
+	bool do_cluster;
+	int aff_lvl = 0, state_id = 0, ret;
 
 	if (idx <= 0 || !cpu || idx >= cpu->nlevels) {
 		wfi();
@@ -609,14 +762,23 @@ static int lpm_cpuidle_enter(struct cpuidle_device *dev,
 		return 0;
 	}
 
-	/*
-	 * Enter per-core PSCI power collapse without cluster_prepare() so
-	 * screen-on idle never escalates into L3 llcc-off (6.56 ms exit)
-	 * or contends on cluster->sync_lock across all 8 cores.
-	 */
-	state_id = PSCI_POWER_STATE(cpu->levels[idx].is_reset) +
-		   cpu->levels[idx].psci_id;
+	do_cluster = READ_ONCE(cluster_idle_enabled) &&
+		     !suspend_in_progress &&
+		     !lpm_cluster_input_active();
+
+	if (do_cluster) {
+		cluster_prepare(cpu->parent, cpumask, idx, true, 0);
+		state_id = get_cluster_id(cpu->parent, &aff_lvl, true);
+	}
+
+	state_id += PSCI_POWER_STATE(cpu->levels[idx].is_reset) +
+		    PSCI_AFFINITY_LEVEL(aff_lvl) +
+		    cpu->levels[idx].psci_id;
 	ret = arm_cpuidle_suspend(state_id);
+
+	if (do_cluster)
+		cluster_unprepare(cpu->parent, cpumask, idx, true, 0,
+				  ret == 0);
 
 	if (cpu->levels[idx].is_reset)
 		cpu_pm_exit();
@@ -966,6 +1128,13 @@ static int lpm_probe(struct platform_device *pdev)
 		pr_err("Failed to create cluster level nodes\n");
 		goto failed;
 	}
+
+#ifdef CONFIG_INPUT
+	if (input_register_handler(&lpm_input_handler))
+		pr_warn("Failed to register cluster idle input handler\n");
+	else
+		lpm_input_registered = true;
+#endif
 
 	return 0;
 failed:
