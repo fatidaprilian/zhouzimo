@@ -28,6 +28,8 @@
 #include <linux/mutex.h>
 #include <linux/kthread.h>
 #include <linux/freezer.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
 
 enum common_ev_idx {
 	INST_IDX,
@@ -119,7 +121,7 @@ struct memlat_mon {
  * @thread:			The kthread used for handling updates.
  * @waitq:			Waitqueue to wake the kthread.
  * @kick:			Atomic flag to signal the kthread.
- * @timer:			High-resolution timer for periodic kicks.
+ * @timer:			Deferrable timer for periodic kicks.
  * @update_ms:			The frequency with which @timer triggers.
  * @num_mons:		The number of @mons for this cpu_grp.
  * @num_inited_mons:	The number of @mons who have probed.
@@ -139,7 +141,7 @@ struct memlat_cpu_grp {
 	struct task_struct	*thread;
 	wait_queue_head_t	waitq;
 	atomic_t		kick;
-	struct hrtimer		timer;
+	struct timer_list	timer;
 	unsigned int		update_ms;
 
 	unsigned int		num_mons;
@@ -334,15 +336,12 @@ static void free_common_evs(struct memlat_cpu_grp *cpu_grp)
 	}
 }
 
-static enum hrtimer_restart memlat_hrtimer_handler(struct hrtimer *timer)
+static void memlat_timer_handler(struct timer_list *t)
 {
-	struct memlat_cpu_grp *cpu_grp =
-		container_of(timer, struct memlat_cpu_grp, timer);
+	struct memlat_cpu_grp *cpu_grp = from_timer(cpu_grp, t, timer);
 
 	if (!atomic_xchg(&cpu_grp->kick, 1))
 		wake_up(&cpu_grp->waitq);
-
-	return HRTIMER_NORESTART;
 }
 
 static int memlat_thread(void *data)
@@ -385,9 +384,8 @@ static int memlat_thread(void *data)
 			}
 
 			if (cpu_grp->update_ms != UINT_MAX)
-				hrtimer_start(&cpu_grp->timer,
-					      ms_to_ktime(cpu_grp->update_ms),
-					      HRTIMER_MODE_REL);
+				mod_timer(&cpu_grp->timer, jiffies +
+					  msecs_to_jiffies(cpu_grp->update_ms));
 		}
 
 		mutex_unlock(&cpu_grp->mons_lock);
@@ -451,17 +449,16 @@ static int start_hwmon(struct memlat_hwmon *hw)
 
 	mon->is_active = true;
 
-	if (should_init_cpu_grp)
-		hrtimer_start(&cpu_grp->timer,
-			      ms_to_ktime(cpu_grp->update_ms),
-			      HRTIMER_MODE_REL);
+	if (should_init_cpu_grp && cpu_grp->update_ms != UINT_MAX)
+		mod_timer(&cpu_grp->timer,
+			  jiffies + msecs_to_jiffies(cpu_grp->update_ms));
 
 unlock_out:
 	if (ret < 0 && should_init_cpu_grp) {
 		struct task_struct *thread = cpu_grp->thread;
 
 		cpu_grp->thread = NULL;
-		hrtimer_cancel(&cpu_grp->timer);
+		del_timer_sync(&cpu_grp->timer);
 		free_common_evs(cpu_grp);
 
 		mutex_unlock(&cpu_grp->mons_lock);
@@ -503,7 +500,7 @@ static void stop_hwmon(struct memlat_hwmon *hw)
 	if (!cpu_grp->num_active_mons) {
 		struct task_struct *thread;
 
-		hrtimer_cancel(&cpu_grp->timer);
+		del_timer_sync(&cpu_grp->timer);
 		thread = cpu_grp->thread;
 		cpu_grp->thread = NULL;
 		free_common_evs(cpu_grp);
@@ -536,11 +533,10 @@ static void set_update_ms(struct memlat_cpu_grp *cpu_grp)
 	if (new_update_ms != cpu_grp->update_ms) {
 		cpu_grp->update_ms = new_update_ms;
 		if (new_update_ms == UINT_MAX)
-			hrtimer_cancel(&cpu_grp->timer);
+			del_timer_sync(&cpu_grp->timer);
 		else
-			hrtimer_start(&cpu_grp->timer,
-				      ms_to_ktime(new_update_ms),
-				      HRTIMER_MODE_REL);
+			mod_timer(&cpu_grp->timer,
+				  jiffies + msecs_to_jiffies(new_update_ms));
 	}
 }
 
@@ -669,8 +665,7 @@ static int memlat_cpu_grp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mutex_init(&cpu_grp->mons_lock);
-	hrtimer_init(&cpu_grp->timer, CLOCK_BOOTTIME, HRTIMER_MODE_REL);
-	cpu_grp->timer.function = memlat_hrtimer_handler;
+	timer_setup(&cpu_grp->timer, memlat_timer_handler, TIMER_DEFERRABLE);
 	init_waitqueue_head(&cpu_grp->waitq);
 	atomic_set(&cpu_grp->kick, 0);
 	cpu_grp->update_ms = DEFAULT_UPDATE_MS;
