@@ -307,6 +307,13 @@ jobs:
           ]
 
           rel_url = f"https://github.com/{repo}/releases/tag/{urllib.parse.quote(release_tag, safe='')}"
+          managers_plain = "Managers: KernelSU | NoroiSU | MidoriSU"
+          managers_html = (
+              '<b>Managers:</b> '
+              '<a href="https://github.com/backslashxx/KernelSU/releases">KernelSU</a> | '
+              '<a href="https://github.com/re-noroi/KernelSU/releases">NoroiSU</a> | '
+              '<a href="https://github.com/midori01/KernelSU/releases">MidoriSU</a>'
+          )
           footer_plain = "GitHub Release"
           footer_html = f'<a href="{e(rel_url, quote=True)}">GitHub Release</a>'
           if prev_tag:
@@ -316,7 +323,7 @@ jobs:
 
           # Telegram sendDocument caption limit is 1024 parsed characters; reserve margin for overflow line
           max_plain = 940
-          used = sum(len(line) + 1 for line in header_plain) + len(footer_plain) + 2
+          used = sum(len(line) + 1 for line in header_plain) + len(managers_plain) + 1 + len(footer_plain) + 2
           body_html = []
           shown = 0
           for subj in subjects[:15]:
@@ -334,7 +341,7 @@ jobs:
           elif remaining > 0:
               body_html.append(f"• <i>...and {remaining} more commits</i>")
 
-          print("\n".join(header_html + body_html + ["", footer_html]))
+          print("\n".join(header_html + body_html + ["", managers_html, footer_html]))
           PY
 
           resp=$(printf 'url = "https://api.telegram.org/bot%s/sendDocument"\n' "${TG_BOT_TOKEN}" | \
